@@ -1,0 +1,4 @@
+# all pycache files
+__pycache__/
+.vscode/
+dataset/
