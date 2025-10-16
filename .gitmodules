@@ -1,0 +1,3 @@
+[submodule "gym_pusht"]
+	path = gym_pusht
+	url = git@github.com:albiLo17/gym_pusht.git
