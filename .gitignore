@@ -3,9 +3,5 @@ __pycache__/
 .vscode/
 datasets/
 
-casino/
-gym_pusht/
-spatialdecomposition/
-
 # all egg-info
 *.egg-info/
