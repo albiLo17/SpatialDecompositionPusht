@@ -37,6 +37,11 @@ uv pip install -e .
 5. PyTorch note (optional)
 For best results with `torch`/`torchvision`/`torchaudio` (CUDA vs CPU wheels), install the correct wheels first following https://pytorch.org/ and then run steps above.
 
+6. Additional module for visualization and rendering in the cluster:
+```bash
+conda install -c conda-forge ffmpeg=6.* "libstdcxx-ng>=12" -y
+```
+
 ## Usage
 TBD, but ideally the steps are: download dataset, train DP to see if it works, install Nick's repo and integrate it to segment the demos, adjust and train the model.
 

@@ -25,6 +25,7 @@ dependencies = [
   "tqdm",
   "gdown",
   "wandb",
+  "debugpy"
 ]
 
 [build-system]

@@ -12,6 +12,7 @@ from diffusers import DDPMScheduler
 from diffusers.training_utils import EMAModel
 from diffusers.optimization import get_scheduler
 
+from eval_diffusion import evaluate_model
 from network import ConditionalUnet1D
 import gdown
 from push_t_dataset import PushTStateDataset
@@ -20,29 +21,32 @@ from push_t_dataset import PushTStateDataset
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--dataset-path", type=str, default="datasets/pusht_cchi_v7_replay.zarr.zip")
-    p.add_argument("--episodes", type=int, default=100)  # kept for backwards compat if used
-    p.add_argument("--max-demos", type=int, default=None,
+    p.add_argument("--max_demos", type=int, default=None,
                    help="Maximum number of demonstration samples (dataset entries) to use for training")
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--epochs", type=int, default=100)
-    p.add_argument("--device", type=str, default=None, help="cuda or cpu; autodetect if not set")
     p.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     p.add_argument("--wandb-project", type=str, default="sd-pusht")
+    # add evaluation step every N epochs
+    p.add_argument("--eval-every", type=int, default=10, help="Evaluate every N epochs (0 = no evaluation during training)")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+    
+    exp_name = f"sd-pusht-dp-demos-{args.max_demos}-seed{args.seed}"
+    print(f"Experiment: {exp_name}")
 
     # optional wandb
     if args.wandb:
-        try:
-            import wandb
-            wandb_available = True
-            wandb.init(project=args.wandb_project, config=vars(args))
-        except Exception:
-            wandb_available = False
+        print("Using Weights & Biases logging")
+        import wandb
+        wandb_available = True
+        wandb.init(project=args.wandb_project, config=vars(args))
+        # define also name of the run
+        wandb.run.name = exp_name
     else:
         wandb_available = False
 
@@ -79,12 +83,7 @@ if __name__ == "__main__":
         pin_memory=True,
         persistent_workers=True
     )
-
-    # device selection
-    if args.device:
-        device = torch.device(args.device)
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # visualize data in batch
     batch = next(iter(dataloader))
@@ -179,17 +178,44 @@ if __name__ == "__main__":
             tglobal.set_postfix(loss=mean_epoch_loss)
             if wandb_available:
                 wandb.log({"train/epoch_loss": mean_epoch_loss, "train/epoch": epoch_idx})
+            # evaluation step
+            if args.eval_every > 0 and (epoch_idx + 1) % args.eval_every == 0:
+                
+                # Evaluate EMA-weighted model without modifying the training model
+                ema_model = ConditionalUnet1D(
+                    input_dim=action_dim,
+                    global_cond_dim=obs_dim * obs_horizon
+                ).to(device)
+                ema.copy_to(ema_model.parameters())   # copy averaged weights into a fresh model
+                ema_model.eval()
+                print(f"Running evaluation at epoch {epoch_idx + 1}...")
+                eval_results = evaluate_model(
+                    noise_pred_net=ema_model,
+                    noise_scheduler=noise_scheduler,
+                    stats=stats,
+                    out_path=f"log/dp/{exp_name}/eval_epoch_{epoch_idx + 1}.mp4",
+                    num_envs=16,
+                    max_steps=300,
+                    num_diffusion_iters=num_diffusion_iters,
+                    pred_horizon=pred_horizon,
+                    obs_horizon=obs_horizon,
+                    action_horizon=action_horizon,
+                    device=device
+                )
+                
+                # log success rate in wandb
+                if wandb_available:
+                    wandb.log({"eval/epoch": epoch_idx + 1, 
+                               "eval/Success Rate": eval_results['success_rate']})
 
-    # Copy EMA weights to a model for saving/inference
-    ema_noise_pred_net = noise_pred_net
-    ema.copy_to(ema_noise_pred_net.parameters())
-
+    # Copy EMA weights to a fresh model and save checkpoint (do not overwrite training model)
+    ema_model = ConditionalUnet1D(input_dim=action_dim, global_cond_dim=obs_dim * obs_horizon).to(device)
+    ema.copy_to(ema_model.parameters())
     # save checkpoint
-    ckpt_dir = "checkpoints"
+    ckpt_dir = "log/dp/{exp_name}/checkpoints"
     os.makedirs(ckpt_dir, exist_ok=True)
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    ckpt_path = os.path.join(ckpt_dir, f"ema_noise_pred_net_{ts}.pt")
-    torch.save(ema_noise_pred_net.state_dict(), ckpt_path)
+    ckpt_path = os.path.join(ckpt_dir, f"ema_noise_pred_net.pt")
+    torch.save(ema_model.state_dict(), ckpt_path)
     print(f"Saved checkpoint: {ckpt_path}")
 
     if wandb_available:

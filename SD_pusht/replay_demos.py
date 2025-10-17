@@ -3,6 +3,7 @@ import argparse
 import zarr
 import numpy as np
 from gym_pusht.envs.pusht import PushTEnv
+import tqdm
 
 def apply_legacy_state(env, state):
     # state: [agent_x, agent_y, block_x, block_y, block_angle]
@@ -29,7 +30,7 @@ def unnormalize(ndata, stats):
     ndata = (ndata + 1.0) / 2.0
     return ndata * (stats['max'] - stats['min']) + stats['min']
 
-def main(dataset_path, episode_idx=0, speed=1.0, normalized_actions=False):
+def main(dataset_path, episode_idx=0, speed=1.0, normalized_actions=False, headless=False):
     ds = zarr.open(dataset_path, 'r')
     episode_ends = ds['meta']['episode_ends'][:]
     if episode_idx < 0 or episode_idx >= len(episode_ends):
@@ -53,7 +54,8 @@ def main(dataset_path, episode_idx=0, speed=1.0, normalized_actions=False):
         actions = unnormalize(actions, stats['action'])
 
 
-    env = PushTEnv(render_mode="human", legacy=True)
+    render_mode = None if headless else "human"
+    env = PushTEnv(render_mode=render_mode, legacy=True)
     # ensure environment will open human window and reset to the episode's first state
     options = {"reset_to_state": states[0]}
     obs, info = env.reset(options=options)
@@ -61,15 +63,21 @@ def main(dataset_path, episode_idx=0, speed=1.0, normalized_actions=False):
     # use the env metadata key used in PushTEnv for fps
     dt = 1.0 / env.metadata.get("render_fps", 10)
     delay = dt / max(1.0, speed)
+    
+    print(f"Playing back episode {episode_idx} with {len(actions)} steps at speed x{speed:.2f} {'(headless)' if headless else ''}...")
 
-    for a in actions:
+    for a in tqdm.tqdm(actions):
+        
         # ensure action is numpy float array of shape (2,)
         action = np.array(a, dtype=np.float32)
         obs, reward, terminated, truncated, info = env.step(action)
-        env.render()
+        if not headless:
+            env.render()
         time.sleep(delay)
         if terminated or truncated:
             break
+        
+    print("Episode playback finished.")
 
     env.close()
 
@@ -79,5 +87,6 @@ if __name__ == "__main__":
     ap.add_argument("--episode", "-e", type=int, default=0)
     ap.add_argument("--speed", "-s", type=float, default=1.0, help="playback speed multiplier (1.0 = real time)")
     ap.add_argument("--normalized-actions", action="store_true", help="set if actions in dataset are normalized [-1,1]")
+    ap.add_argument("--headless", action="store_true", help="run without opening a rendering window (headless)")
     args = ap.parse_args()
-    main(args.dataset, episode_idx=args.episode, speed=args.speed, normalized_actions=args.normalized_actions)
+    main(args.dataset, episode_idx=args.episode, speed=args.speed, normalized_actions=args.normalized_actions, headless=args.headless)

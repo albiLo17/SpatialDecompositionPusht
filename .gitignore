@@ -3,6 +3,11 @@ __pycache__/
 .vscode/
 datasets/
 pusht_demos_npz/
+scripts/
+log/
+logs/
+wandb/ 
+*.mp4
 
 # all egg-info
 *.egg-info/
