@@ -212,7 +212,7 @@ if __name__ == "__main__":
     ema_model = ConditionalUnet1D(input_dim=action_dim, global_cond_dim=obs_dim * obs_horizon).to(device)
     ema.copy_to(ema_model.parameters())
     # save checkpoint
-    ckpt_dir = "log/dp/{exp_name}/checkpoints"
+    ckpt_dir = f"log/dp/{exp_name}/checkpoints"
     os.makedirs(ckpt_dir, exist_ok=True)
     ckpt_path = os.path.join(ckpt_dir, f"ema_noise_pred_net.pt")
     torch.save(ema_model.state_dict(), ckpt_path)

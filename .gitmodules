@@ -10,9 +10,12 @@
 [submodule "libero"]
 	path = libero
 	url = git@rlgit.informatik.uni-freiburg.de:spatialdecomposition/libero.git
+	branch = master
 [submodule "robomimic"]
 	path = robomimic
 	url = git@rlgit.informatik.uni-freiburg.de:spatialdecomposition/robomimic.git
+	branch = master
 [submodule "robosuite"]
 	path = robosuite
 	url = git@rlgit.informatik.uni-freiburg.de:spatialdecomposition/robosuite.git
+	branch = master
