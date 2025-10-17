@@ -7,3 +7,12 @@
 [submodule "casino"]
 	path = casino
 	url = git@github.com:SuperN1ck/casino.git
+[submodule "libero"]
+	path = libero
+	url = git@rlgit.informatik.uni-freiburg.de:spatialdecomposition/libero.git
+[submodule "robomimic"]
+	path = robomimic
+	url = git@rlgit.informatik.uni-freiburg.de:spatialdecomposition/robomimic.git
+[submodule "robosuite"]
+	path = robosuite
+	url = git@rlgit.informatik.uni-freiburg.de:spatialdecomposition/robosuite.git
