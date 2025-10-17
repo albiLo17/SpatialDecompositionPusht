@@ -2,6 +2,7 @@
 __pycache__/
 .vscode/
 datasets/
+pusht_demos_npz/
 
 # all egg-info
 *.egg-info/
