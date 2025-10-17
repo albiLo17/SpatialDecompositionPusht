@@ -1,34 +1,8 @@
-from typing import Tuple, Sequence, Dict, Union, Optional
 import numpy as np
-import math
 import torch
-import torch.nn as nn
-import collections
 import zarr
-from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
-from diffusers.training_utils import EMAModel
-from diffusers.optimization import get_scheduler
-from tqdm.auto import tqdm
-
-# env import
-import gym
-from gym import spaces
-import pygame
-import pymunk
-import pymunk.pygame_util
-from pymunk.space_debug_draw_options import SpaceDebugColor
-from pymunk.vec2d import Vec2d
-import shapely.geometry as sg
-import cv2
-import skimage.transform as st
-from skvideo.io import vwrite
-from IPython.display import Video
 import gdown
 import os
-
-from push_t_env import PushTEnv
-
-from huggingface_hub.utils import IGNORE_GIT_FOLDER_PATTERNS
 
 def create_sample_indices(
         episode_ends:np.ndarray, sequence_length:int,
@@ -102,7 +76,7 @@ def unnormalize_data(ndata, stats):
 # dataset
 class PushTStateDataset(torch.utils.data.Dataset):
     def __init__(self, dataset_path,
-                 pred_horizon, obs_horizon, action_horizon):
+                 pred_horizon, obs_horizon, action_horizon, max_demos=None):
 
         # read from zarr dataset
         dataset_root = zarr.open(dataset_path, 'r')
@@ -116,6 +90,9 @@ class PushTStateDataset(torch.utils.data.Dataset):
         # Marks one-past the last index for each episode
         episode_ends = dataset_root['meta']['episode_ends'][:]
 
+        if max_demos is not None:
+            episode_ends = episode_ends[:max_demos]
+            
         # compute start and end of each state-action sequence
         # also handles padding
         indices = create_sample_indices(
@@ -165,10 +142,14 @@ class PushTStateDataset(torch.utils.data.Dataset):
 
 if __name__ == "__main__":
     # download demonstration data from Google Drive
-    dataset_path = "pusht_cchi_v7_replay.zarr.zip"
+    dataset_path = "datasets/pusht_cchi_v7_replay.zarr.zip"
     if not os.path.isfile(dataset_path):
+        print("Downloading dataset...")
+        os.makedirs(os.path.dirname(dataset_path), exist_ok=True)
         id = "1KY1InLurpMvJDRb14L9NlXT_fEsCvVUq&confirm=t"
         gdown.download(id=id, output=dataset_path, quiet=False)
+    else:
+        print(f"Dataset already exists: {dataset_path}")
 
     # parameters
     pred_horizon = 16

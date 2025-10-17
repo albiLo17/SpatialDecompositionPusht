@@ -1,0 +1,36 @@
+[project]
+name = "sd-pusht"
+version = "0.1.0"
+description = "Spatial Decomposition Evaluated on the PushT environment"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{name = "Alberta Longhini", email = "alberta.longhini@gmail.com"}]
+license = "MIT"
+dependencies = [
+  "scikit-image==0.20.0",
+  "scikit-video==1.1.11",
+  "numpy",
+  "zarr==2.18.3",
+  "numcodecs==0.13.1",
+  "torch",
+  "torchvision",
+  "torchaudio",
+  "diffusers>=0.15.0",
+  "huggingface-hub>=0.15.0",
+  "transformers>=4.30.0",
+  "pygame",
+  "pymunk==6.2.1",
+  "shapely",
+  "opencv-python",
+  "tqdm",
+  "gdown",
+  "wandb",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["SD_pusht*"]

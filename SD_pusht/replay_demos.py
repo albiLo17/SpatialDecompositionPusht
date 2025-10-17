@@ -1,11 +1,7 @@
-# filepath: replay_demos.py
 import time
 import argparse
 import zarr
 import numpy as np
-import gym
-import gym_pusht  # registers gym_pusht/PushT-v0
-# from push_t_env import PushTEnv
 from gym_pusht.envs.pusht import PushTEnv
 
 def apply_legacy_state(env, state):
@@ -56,33 +52,7 @@ def main(dataset_path, episode_idx=0, speed=1.0, normalized_actions=False):
         # here we assume stats['action'] with 'min'/'max' arrays
         actions = unnormalize(actions, stats['action'])
 
-# ###########################################
-#     # create environment
-#     env = PushTEnv()
-#     # ensure environment will open human window and reset to the episode's first state
-#     env.reset_to_state = states[0]
-#     obs, info = env.reset()
-#     # force opening the human-render window immediately
-#     try:
-#         env.render(mode="human")
-#     except TypeError:
-#         # fallback if env.render does not accept mode arg
-#         env.render()
-#     # use the env metadata key used in PushTEnv for fps
-#     dt = 1.0 / env.metadata.get("video.frames_per_second", 10)
-#     delay = dt / max(1.0, speed)
 
-#     for a in actions:
-#         # ensure action is numpy float array of shape (2,)
-#         action = np.array(a, dtype=np.float32)
-#         obs, reward, terminated, truncated, info = env.step(action)
-#         env.render(mode="human")
-#         time.sleep(delay)
-#         if terminated or truncated:
-#             break
-
-#     env.close()     
-    # ###########################################
     env = PushTEnv(render_mode="human", legacy=True)
     # ensure environment will open human window and reset to the episode's first state
     options = {"reset_to_state": states[0]}
@@ -105,7 +75,7 @@ def main(dataset_path, episode_idx=0, speed=1.0, normalized_actions=False):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", default="pusht_cchi_v7_replay.zarr.zip", help="path to zarr dataset (e.g. pusht_cchi_v7_replay.zarr.zip)")
+    ap.add_argument("--dataset", default="datasets/pusht_cchi_v7_replay.zarr.zip", help="path to zarr dataset (e.g. pusht_cchi_v7_replay.zarr.zip)")
     ap.add_argument("--episode", "-e", type=int, default=0)
     ap.add_argument("--speed", "-s", type=float, default=1.0, help="playback speed multiplier (1.0 = real time)")
     ap.add_argument("--normalized-actions", action="store_true", help="set if actions in dataset are normalized [-1,1]")

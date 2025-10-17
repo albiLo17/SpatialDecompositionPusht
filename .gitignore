@@ -1,4 +1,11 @@
 # all pycache files
 __pycache__/
 .vscode/
-dataset/
+datasets/
+
+casino/
+gym_pusht/
+spatialdecomposition/
+
+# all egg-info
+*.egg-info/

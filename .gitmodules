@@ -1,3 +1,9 @@
 [submodule "gym_pusht"]
 	path = gym_pusht
 	url = git@github.com:albiLo17/gym_pusht.git
+[submodule "spatialdecomposition"]
+	path = spatialdecomposition
+	url = git@rlgit.informatik.uni-freiburg.de:spatialdecomposition/spatialdecomposition.git
+[submodule "casino"]
+	path = casino
+	url = git@github.com:SuperN1ck/casino.git
