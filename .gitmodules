@@ -19,3 +19,7 @@
 	path = robosuite
 	url = git@rlgit.informatik.uni-freiburg.de:spatialdecomposition/robosuite.git
 	branch = master
+[submodule "diffusion_policy"]
+	path = diffusion_policy
+	url = https://github.com/real-stanford/diffusion_policy.git
+	branch = main
