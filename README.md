@@ -26,6 +26,10 @@ git submodule update --init --recursive
 uv pip install -e gym_pusht 
 uv pip install -e spatialdecomposition
 uv pip install -e casino
+uv pip install -e robosuite
+uv pip install -e robomimic
+uv pip install -e libero
+uv pip install -e diffusion_policy
 ```
 
 4. Install the main package in editable (development) mode:
@@ -52,4 +56,12 @@ python SD_pusht/push_t_dataset.py
 2. Visualize one demonstration:
 ```bash
 python SD_pusht/replay_demos.py -e 4
+```
+3. Convert the dataset into ToyDataset and Segment it by contacts with the object:
+```bash
+python SD_pusht/convert_pusht_to_toydataset.py \
+    --input datasets/pusht_cchi_v7_replay.zarr.zip \
+    --output datasets/pusht_toy_dataset_segmented.npz \
+    --traj-length 64 --max-episodes 1000 
+
 ```

@@ -25,8 +25,21 @@ dependencies = [
   "tqdm",
   "gdown",
   "wandb",
-  "debugpy"
-]
+  "debugpy",
+  "h5py",
+  "matplotlib",
+  "pypose",
+  "tyro",
+  "flow_matching",
+  "einops",
+  "tensordict",
+  "easydict",
+  "omegaconf",
+  "hydra-core",
+  "thop",
+  "ipykernel",
+  "jupyter"
+  ]
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]

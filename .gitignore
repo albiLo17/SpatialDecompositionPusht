@@ -9,5 +9,30 @@ logs/
 wandb/ 
 *.mp4
 
+# ignore all the submodules
+casino/
+diffusion_policy/
+gym_pusht/
+libero/
+robomimic/
+robosuite/
+spatialdecomposition/
+
 # all egg-info
 *.egg-info/
+
+setup_env.sh
+*.png
+casino/
+spatialdecomposition/
+robosuite/
+robomimic/
+libero/
+gym_pusht/
+diffusion_policy/
+test_gifs/
+
+
+
+
+
