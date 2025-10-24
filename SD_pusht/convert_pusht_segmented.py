@@ -7,7 +7,7 @@ Example (Segmented by contact):
   python SD_pusht/convert_pusht_segmented.py \
     --input datasets/pusht_cchi_v7_replay.zarr.zip \
     --output datasets/pusht_toy_dataset_segmented.npz \
-    --traj-length 64 
+    --traj-length 64 --normalize
     
 """
 
@@ -31,6 +31,13 @@ if SPATIALDECOMP_PATH not in sys.path:
 
 from SpatialDecomposition.TwoD_table_play.data import ToyDataset
 
+# normalize data
+def get_data_stats(data):
+    data = data.reshape(-1,data.shape[-1])
+    min_val = torch.min(data, axis=0).values
+    max_val = torch.max(data, axis=0).values
+    
+    return min_val, max_val
 
 def segment_trajectory_by_contact(states, actions, contact_threshold=0.1, min_segment_length=5):
     """Segment a trajectory based on contact with the object."""
@@ -159,8 +166,12 @@ def main():
     # Convert to tensors
     trajectories = torch.from_numpy(np.stack(all_trajectories, axis=0))
     
+    # implement proper normalization between [-1, 1] using the min and max of the data
+    
     if args.normalize:
-        trajectories = trajectories / 512.0
+        min_val, max_val = get_data_stats(trajectories)
+        trajectories = (trajectories - min_val) / (max_val - min_val)
+        trajectories = trajectories * 2 - 1
 
     # Print statistics
     contact_segments = sum(1 for m in all_metadata if m['contact_flag'])
@@ -182,9 +193,17 @@ def main():
     dataset.store_to_file(out_path)
     print(f"Saved dataset: {out_path.with_suffix('.npz')}")
     
-    # Save metadata
+    # Save metadata, storing the min and max of the data
     metadata_path = out_path.parent / f"{out_path.stem}_metadata.npz"
-    np.savez(metadata_path, 
+    if args.normalize:
+        np.savez(metadata_path, 
+            segment_metadata=all_metadata,
+            contact_threshold=0.1,
+            min_segment_length=5,
+            min_val=min_val.numpy(),
+            max_val=max_val.numpy())
+    else:
+        np.savez(metadata_path, 
             segment_metadata=all_metadata,
             contact_threshold=0.1,
             min_segment_length=5)

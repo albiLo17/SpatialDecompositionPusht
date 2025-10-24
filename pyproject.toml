@@ -38,7 +38,10 @@ dependencies = [
   "hydra-core",
   "thop",
   "ipykernel",
-  "jupyter"
+  "jupyter",
+  "scikit-learn",
+  "hdbscan",
+  "dtaidistance"
   ]
 
 [build-system]
