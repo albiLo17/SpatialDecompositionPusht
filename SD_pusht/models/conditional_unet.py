@@ -1,7 +1,10 @@
+"""Conditional U-Net model for diffusion policy."""
+
 import math
 from typing import Union
 import torch
 import torch.nn as nn
+
 
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
@@ -26,6 +29,7 @@ class Downsample1d(nn.Module):
     def forward(self, x):
         return self.conv(x)
 
+
 class Upsample1d(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -36,9 +40,9 @@ class Upsample1d(nn.Module):
 
 
 class Conv1dBlock(nn.Module):
-    '''
-        Conv1d --> GroupNorm --> Mish
-    '''
+    """
+    Conv1d --> GroupNorm --> Mish
+    """
 
     def __init__(self, inp_channels, out_channels, kernel_size, n_groups=8):
         super().__init__()
@@ -82,13 +86,13 @@ class ConditionalResidualBlock1D(nn.Module):
             if in_channels != out_channels else nn.Identity()
 
     def forward(self, x, cond):
-        '''
-            x : [ batch_size x in_channels x horizon ]
-            cond : [ batch_size x cond_dim]
+        """
+        x : [ batch_size x in_channels x horizon ]
+        cond : [ batch_size x cond_dim]
 
-            returns:
-            out : [ batch_size x out_channels x horizon ]
-        '''
+        returns:
+        out : [ batch_size x out_channels x horizon ]
+        """
         out = self.blocks[0](x)
         embed = self.cond_encoder(cond)
 
@@ -243,3 +247,4 @@ class ConditionalUnet1D(nn.Module):
         x = x.moveaxis(-1,-2)
         # (B,T,C)
         return x
+

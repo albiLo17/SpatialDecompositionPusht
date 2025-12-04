@@ -6,30 +6,29 @@ pusht_demos_npz/
 scripts/
 log/
 logs/
+logs_berzelius/
+analysis_results/
 wandb/ 
+SD_pusht/notebooks/notebook_renders/
 *.mp4
 
 # ignore all the submodules
 casino/
+casino
 diffusion_policy/
 gym_pusht/
 libero/
 robomimic/
 robosuite/
 spatialdecomposition/
+spatialdecomposition
 
 # all egg-info
 *.egg-info/
 
 setup_env.sh
 *.png
-casino/
-spatialdecomposition/
-robosuite/
-robomimic/
-libero/
-gym_pusht/
-diffusion_policy/
+*.gif
 test_gifs/
 
 

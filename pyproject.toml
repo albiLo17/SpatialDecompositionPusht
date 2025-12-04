@@ -41,7 +41,8 @@ dependencies = [
   "jupyter",
   "scikit-learn",
   "hdbscan",
-  "dtaidistance"
+  "dtaidistance",
+  "seaborn"
   ]
 
 [build-system]
