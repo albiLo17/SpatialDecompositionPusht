@@ -9,6 +9,8 @@ logs/
 logs_berzelius/
 analysis_results/
 wandb/ 
+plots/
+debug_visualizations/
 SD_pusht/notebooks/notebook_renders/
 *.mp4
 

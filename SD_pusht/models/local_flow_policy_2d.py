@@ -32,6 +32,66 @@ except ImportError:
         return data
 
 
+class ObservationEncoder(nn.Module):
+    """
+    Simple MLP encoder for observations.
+    
+    Takes flattened observations and encodes them to a fixed dimension (128).
+    This encoder is shared between the position decoder and the action prediction network.
+    """
+    
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int = 128,
+        activation: str = "mish",
+    ):
+        """
+        Args:
+            input_dim: Input dimension (obs_horizon * obs_dim)
+            output_dim: Output dimension (default: 128)
+            activation: Activation function ("mish", "relu", "gelu", "tanh")
+        """
+        super().__init__()
+        
+        # Choose activation
+        if activation == "mish":
+            act_fn = nn.Mish()
+        elif activation == "relu":
+            act_fn = nn.ReLU()
+        elif activation == "gelu":
+            act_fn = nn.GELU()
+        elif activation == "tanh":
+            act_fn = nn.Tanh()
+        else:
+            raise ValueError(f"Unknown activation: {activation}")
+        
+        # Two small layers: input_dim -> intermediate -> output_dim
+        # Use intermediate dimension as mean of input and output
+        intermediate_dim = (input_dim + output_dim) // 2
+        
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, intermediate_dim),
+            act_fn,
+            nn.LayerNorm(intermediate_dim),
+            nn.Linear(intermediate_dim, output_dim),
+            act_fn,
+            nn.LayerNorm(output_dim),
+        )
+    
+    def forward(self, obs_flat: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+        
+        Args:
+            obs_flat: Flattened observations, shape (B, input_dim)
+        
+        Returns:
+            Encoded observations, shape (B, output_dim)
+        """
+        return self.encoder(obs_flat)
+
+
 class PositionMLP(nn.Module):
     """
     MLP backbone for position prediction with timestep and observation conditioning.
@@ -237,6 +297,7 @@ class Position2DFlowDecoder(nn.Module):
         mlp_hidden_dims: list = None,
         mlp_activation: str = "mish",
         use_flow_matching: bool = True,
+        num_particles: int = 1,
     ):
         """
         Args:
@@ -250,6 +311,8 @@ class Position2DFlowDecoder(nn.Module):
             mlp_hidden_dims: Hidden layer dimensions for MLP
             mlp_activation: Activation function for MLP ("mish", "relu", "gelu", "tanh")
             use_flow_matching: If False, use direct regression instead of flow matching (only works with "mlp" backbone)
+            num_particles: Number of particles to sample for position prediction (only used if use_flow_matching=True).
+                If > 1, samples multiple positions and returns the median. Default: 1 (single sample).
         """
         super().__init__()
         
@@ -257,6 +320,7 @@ class Position2DFlowDecoder(nn.Module):
         self.fm_timesteps = fm_timesteps
         self.backbone = backbone.lower()
         self.use_flow_matching = use_flow_matching
+        self.num_particles = num_particles
         
         # Handle direct MLP (no flow matching)
         if self.backbone == "mlp_direct" or (self.backbone == "mlp" and not use_flow_matching):
@@ -329,9 +393,11 @@ class Position2DFlowDecoder(nn.Module):
         Args:
             obs_cond: Observation conditioning, shape (B, obs_cond_dim)
             x_init: Optional initial noise (only used if use_flow_matching=True)
+                If provided and num_particles > 1, this will be used as the first particle.
         
         Returns:
             position: 2D position, shape (B, 2)
+                If num_particles > 1, returns the median across particles.
         """
         if not self.use_flow_matching:
             # Direct regression: MLP(obs) -> position
@@ -341,6 +407,49 @@ class Position2DFlowDecoder(nn.Module):
         B = obs_cond.shape[0]
         device = obs_cond.device
         
+        # If using particles, sample multiple positions and take median
+        if self.num_particles > 1:
+            all_positions = []
+            
+            with torch.no_grad():
+                # Sample particles
+                for p in range(self.num_particles):
+                    # Use provided x_init for first particle if available, otherwise sample
+                    if p == 0 and x_init is not None:
+                        noisy_position = x_init
+                        assert noisy_position.shape == (B, 1, self.POSITION_DIM), \
+                            f"Expected x_init shape ({B}, 1, {self.POSITION_DIM}), got {noisy_position.shape}"
+                    else:
+                        noisy_position = torch.randn(
+                            (B, 1, self.POSITION_DIM), device=device
+                        )
+                    
+                    # Integrate the flow over timesteps for this particle
+                    dt = 1.0 / self.fm_timesteps
+                    denoised_position = noisy_position
+                    
+                    for i in range(self.fm_timesteps):
+                        t = i / self.fm_timesteps
+                        timestep = torch.tensor([t], device=device).repeat(B,)
+                        
+                        vt = self.position_net(
+                            denoised_position, timestep, global_cond=obs_cond
+                        )
+                        denoised_position = (vt * dt + denoised_position)
+                    
+                    # Extract position for this particle
+                    particle_position = denoised_position.squeeze(1)  # (B, POSITION_DIM)
+                    all_positions.append(particle_position)
+            
+            # Stack all particle positions: (num_particles, B, POSITION_DIM)
+            all_positions = torch.stack(all_positions, dim=0)
+            
+            # Take median across particles: (B, POSITION_DIM)
+            position = torch.median(all_positions, dim=0)[0]
+            
+            return position
+        
+        # Single particle inference (original behavior)
         with torch.no_grad():
             # Initialize from noise (single timestep, so horizon=1)
             if x_init is None:
@@ -469,6 +578,7 @@ class LocalFlowPolicy2D(FlowMatching):
         position_decoder_down_dims: list = None,
         position_decoder_n_groups: int = 4,
         position_decoder_fm_timesteps: int = 8,
+        position_decoder_num_particles: int = 1,
         # Loss coefficients
         position_loss_coeff: float = 1.0,
         # Noise sharing
@@ -495,6 +605,8 @@ class LocalFlowPolicy2D(FlowMatching):
             position_decoder_down_dims: Channel dimensions for position decoder U-Net
             position_decoder_n_groups: Number of groups for position decoder GroupNorm
             position_decoder_fm_timesteps: Number of timesteps for position decoder inference
+            position_decoder_num_particles: Number of particles to sample for position prediction.
+                If > 1, samples multiple positions and returns the median. Default: 1 (single sample).
             position_loss_coeff: Overall coefficient for position loss
             share_noise: Whether to share noise between position and action predictions
             shared_noise_base: Base for noise sharing ("action", "position", or "combinatory")
@@ -526,15 +638,25 @@ class LocalFlowPolicy2D(FlowMatching):
         self.use_gt_reference_for_local_policy = use_gt_reference_for_local_policy
         self.transform_obs_to_local_frame = transform_obs_to_local_frame
         
+        # Create shared observation encoder
+        obs_flat_dim = obs_horizon * obs_dim
+        self.obs_encoder_dim = 128
+        self.obs_encoder = ObservationEncoder(
+            input_dim=obs_flat_dim,
+            output_dim=self.obs_encoder_dim,
+            activation="mish",
+        )
+        
         if use_position_decoder:
-            obs_cond_dim = obs_horizon * obs_dim
+            # Position decoder now uses encoded observations
             self.position_decoder = Position2DFlowDecoder(
-                obs_cond_dim=obs_cond_dim,
+                obs_cond_dim=self.obs_encoder_dim,  # Use encoded dimension
                 sigma=sigma,
                 fm_timesteps=position_decoder_fm_timesteps,
                 diffusion_step_embed_dim=diffusion_step_embed_dim,
                 down_dims=position_decoder_down_dims,
                 n_groups=position_decoder_n_groups,
+                num_particles=position_decoder_num_particles,
             )
             # Recreate noise_pred_net with increased global_cond_dim to include reference position
             # The local policy should be aware of the predicted reference frame
@@ -543,13 +665,22 @@ class LocalFlowPolicy2D(FlowMatching):
             noise_net_down_dims = down_dims if down_dims is not None else [256, 512, 1024]
             self.noise_pred_net = ConditionalUnet1D(
                 input_dim=self.act_dim,
-                global_cond_dim=obs_horizon * obs_dim + REF_POSITION_DIM,  # Add reference position dimension
+                global_cond_dim=self.obs_encoder_dim + REF_POSITION_DIM,  # Use encoded obs + reference position
                 diffusion_step_embed_dim=diffusion_step_embed_dim,
                 down_dims=noise_net_down_dims,
                 n_groups=n_groups,
             )
         else:
             self.position_decoder = None
+            # Still need to update noise_pred_net to use encoded observations
+            noise_net_down_dims = down_dims if down_dims is not None else [256, 256]
+            self.noise_pred_net = ConditionalUnet1D(
+                input_dim=self.act_dim,
+                global_cond_dim=self.obs_encoder_dim,  # Use encoded obs
+                diffusion_step_embed_dim=diffusion_step_embed_dim,
+                down_dims=noise_net_down_dims,
+                n_groups=n_groups,
+            )
     
     def _sample_aligned_noise(
         self,
@@ -668,7 +799,8 @@ class LocalFlowPolicy2D(FlowMatching):
         with torch.no_grad():
             # First, get reference position (needed for observation transformation)
             # Use original observations for position decoder
-            obs_cond_for_position = obs_seq.flatten(start_dim=1)  # (B, obs_horizon * obs_dim)
+            obs_flat_for_position = obs_seq.flatten(start_dim=1)  # (B, obs_horizon * obs_dim)
+            obs_encoded_for_position = self.obs_encoder(obs_flat_for_position)  # (B, obs_encoder_dim)
             
             # Predict reference position if using position decoder
             if self.use_position_decoder:
@@ -677,7 +809,7 @@ class LocalFlowPolicy2D(FlowMatching):
                 else:
                     position_noise = None
                 
-                ref_position = self.position_decoder(obs_cond_for_position, x_init=position_noise)
+                ref_position = self.position_decoder(obs_encoded_for_position, x_init=position_noise)
             else:
                 # Use provided reference position or zero
                 if reference_position is not None:
@@ -691,8 +823,9 @@ class LocalFlowPolicy2D(FlowMatching):
             else:
                 obs_seq_local = obs_seq
             
-            # Flatten observations for conditioning
-            obs_cond = obs_seq_local.flatten(start_dim=1)  # (B, obs_horizon * obs_dim)
+            # Flatten and encode observations for conditioning
+            obs_flat_local = obs_seq_local.flatten(start_dim=1)  # (B, obs_horizon * obs_dim)
+            obs_cond = self.obs_encoder(obs_flat_local)  # (B, obs_encoder_dim)
             
             # Sample aligned noise for actions if sharing
             if self.share_noise:
@@ -708,11 +841,11 @@ class LocalFlowPolicy2D(FlowMatching):
                     (B, self.pred_horizon, self.act_dim), device=device
                 )
             
-            # Prepare conditioning: concatenate observation with reference position
+            # Prepare conditioning: concatenate encoded observation with reference position
             # The local policy should be aware of the predicted reference frame
             if self.use_position_decoder:
                 # Concatenate obs_cond with ref_position for local action prediction
-                action_cond = torch.cat([obs_cond, ref_position], dim=-1)  # (B, obs_horizon * obs_dim + 2)
+                action_cond = torch.cat([obs_cond, ref_position], dim=-1)  # (B, obs_encoder_dim + 2)
             else:
                 action_cond = obs_cond
             
@@ -801,7 +934,8 @@ class LocalFlowPolicy2D(FlowMatching):
         
         # Determine which reference position to use for local policy conditioning
         # First, get reference position using original (world frame) observations
-        obs_cond_for_position = obs_seq.flatten(start_dim=1)  # (B, obs_horizon * obs_dim)
+        obs_flat_for_position = obs_seq.flatten(start_dim=1)  # (B, obs_horizon * obs_dim)
+        obs_encoded_for_position = self.obs_encoder(obs_flat_for_position)  # (B, obs_encoder_dim)
         
         # Option 1: Use GT reference position (oracle mode) if flag is set and GT is available
         if self.use_gt_reference_for_local_policy and reference_position is not None:
@@ -812,16 +946,16 @@ class LocalFlowPolicy2D(FlowMatching):
             # Use provided reference position for training (but we'll predict it for conditioning)
             # Predict reference position for conditioning to match inference behavior
             if position_noise is not None:
-                world_ref_position_for_conditioning = self.position_decoder(obs_cond_for_position, x_init=position_noise)
+                world_ref_position_for_conditioning = self.position_decoder(obs_encoded_for_position, x_init=position_noise)
             else:
-                world_ref_position_for_conditioning = self.position_decoder(obs_cond_for_position, x_init=None)
+                world_ref_position_for_conditioning = self.position_decoder(obs_encoded_for_position, x_init=None)
         elif self.use_position_decoder:
             # Predict reference position for conditioning (even if we don't have GT)
             # This ensures the local policy is aware of the predicted frame during training
             if position_noise is not None:
-                world_ref_position_for_conditioning = self.position_decoder(obs_cond_for_position, x_init=position_noise)
+                world_ref_position_for_conditioning = self.position_decoder(obs_encoded_for_position, x_init=position_noise)
             else:
-                world_ref_position_for_conditioning = self.position_decoder(obs_cond_for_position, x_init=None)
+                world_ref_position_for_conditioning = self.position_decoder(obs_encoded_for_position, x_init=None)
         else:
             world_ref_position_for_conditioning = None
         
@@ -839,8 +973,9 @@ class LocalFlowPolicy2D(FlowMatching):
         else:
             obs_seq_local = obs_seq
         
-        # Flatten observations for conditioning
-        obs_cond = obs_seq_local.flatten(start_dim=1)  # (B, obs_horizon * obs_dim)
+        # Flatten and encode observations for conditioning
+        obs_flat_local = obs_seq_local.flatten(start_dim=1)  # (B, obs_horizon * obs_dim)
+        obs_cond = self.obs_encoder(obs_flat_local)  # (B, obs_encoder_dim)
         
         # Transform world actions to local frame
         # Steps: unnormalize world actions → transform to local frame → normalize local actions
@@ -881,11 +1016,11 @@ class LocalFlowPolicy2D(FlowMatching):
         # Sample location along path and get conditional flow
         timestep, xt, ut = self.FM.sample_location_and_conditional_flow(x0, local_action_seq)
         
-        # Prepare conditioning: concatenate observation with reference position
+        # Prepare conditioning: concatenate encoded observation with reference position
         # The local policy should be aware of the reference frame (GT in oracle mode, predicted otherwise)
         if self.use_position_decoder and world_ref_position_for_conditioning is not None:
             # Concatenate obs_cond with reference position for local action prediction
-            action_cond = torch.cat([obs_cond, world_ref_position_for_conditioning], dim=-1)  # (B, obs_horizon * obs_dim + 2)
+            action_cond = torch.cat([obs_cond, world_ref_position_for_conditioning], dim=-1)  # (B, obs_encoder_dim + 2)
         else:
             action_cond = obs_cond
         
@@ -901,10 +1036,10 @@ class LocalFlowPolicy2D(FlowMatching):
         # Note: We always train the position decoder with GT, even in oracle mode
         # Position decoder uses original (world frame) observations, not transformed ones
         if self.use_position_decoder and reference_position is not None:
-            # Use original observations for position decoder (world frame)
-            obs_cond_for_position = obs_seq.flatten(start_dim=1)  # (B, obs_horizon * obs_dim)
+            # Use encoded original observations for position decoder (world frame)
+            # obs_encoded_for_position was already computed above
             position_loss, position_loss_dict = self.position_decoder.compute_loss(
-                obs_cond=obs_cond_for_position,
+                obs_cond=obs_encoded_for_position,
                 gt_positions=reference_position,
                 x_0=position_noise
             )

@@ -711,7 +711,8 @@ def visualize_position_predictions(
     Visualize position decoder predictions vs ground truth on an image.
     
     Args:
-        model: Position2DFlowDecoder model
+        model: Position2DFlowDecoder model or LocalFlowPolicy2D model (if LocalFlowPolicy2D,
+               will extract position_decoder and use obs_encoder for encoding)
         dataset: PushTSegmentedDataset instance
         stats: Dataset statistics for unnormalization
         sample_idx: Index of the sample to visualize
@@ -724,7 +725,19 @@ def visualize_position_predictions(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    model.eval()
+    # Check if model is LocalFlowPolicy2D (has position_decoder and obs_encoder)
+    # or just Position2DFlowDecoder
+    if hasattr(model, 'position_decoder') and hasattr(model, 'obs_encoder'):
+        # Full model passed - extract position decoder and encoder
+        position_decoder = model.position_decoder
+        obs_encoder = model.obs_encoder
+        model.eval()
+        position_decoder.eval()
+    else:
+        # Direct Position2DFlowDecoder passed (backward compatibility)
+        position_decoder = model
+        obs_encoder = None
+        position_decoder.eval()
     
     # Get sample from dataset
     sample = dataset[sample_idx]
@@ -738,9 +751,16 @@ def visualize_position_predictions(
     initial_state_unnorm = unnormalize_data(initial_state[None, :], stats["obs"])[0]
     
     # Get prediction from model
-    obs_cond = obs_seq.flatten(start_dim=1)  # (1, obs_horizon * obs_dim)
+    obs_flat = obs_seq.flatten(start_dim=1)  # (1, obs_horizon * obs_dim)
+    
+    # Encode observations if encoder is available
+    if obs_encoder is not None:
+        obs_cond = obs_encoder(obs_flat)  # (1, obs_encoder_dim)
+    else:
+        obs_cond = obs_flat  # (1, obs_horizon * obs_dim)
+    
     with torch.no_grad():
-        pred_ref_pos = model(obs_cond, x_init=None)  # (1, 2)
+        pred_ref_pos = position_decoder(obs_cond, x_init=None)  # (1, 2)
     
     # Convert to numpy
     pred_ref_pos_np = pred_ref_pos.cpu().numpy()[0]  # (2,)

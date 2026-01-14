@@ -9,9 +9,9 @@ mkdir -p logs_berzelius
 SEEDS=(1234)
 LEARNING_RATES=(1e-4)
 BATCH_SIZES=(256)
-MAX_DEMOS=(200)
-USE_GT_REFERENCE_OPTIONS=(true false)  # Train with and without GT reference frame
-SHARE_NOISE_OPTIONS=(true false)  # Train with and without shared noise
+MAX_DEMOS=(20 60 100 140 180 200)
+USE_GT_REFERENCE_OPTIONS=(true)  # Train with and without GT reference frame
+SHARE_NOISE_OPTIONS=(false)  # Train with and without shared noise
 
 # Launch jobs for each combination
 for seed in "${SEEDS[@]}"; do
@@ -30,6 +30,9 @@ for seed in "${SEEDS[@]}"; do
                             "--batch-size" "$bs"
                             "--max-demos" "$max_demos"
                             "--wandb"
+                            "--use-position-decoder"
+                            "--position-loss-coeff" "1.0"
+                            "--contact-threshold" "0.1"
                         )
                         
                         # Add GT reference flag if needed
