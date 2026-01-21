@@ -31,9 +31,13 @@ USE_POSITION_DECODER=true
 POSITION_DECODER_DOWN_DIMS=(256)
 POSITION_DECODER_N_GROUPS=4
 POSITION_DECODER_FM_TIMESTEPS=8
+POSITION_DECODER_PARTICLES_AGGREGATION="median"
 POSITION_LOSS_COEFF=1.0
 SHARE_NOISE=false
 SHARED_NOISE_BASE="action"
+USE_FILM_CONDITIONING=false
+FILM_HIDDEN_DIM=64
+FILM_PREDICT_SCALE=true
 
 # Dataset segmentation arguments
 CONTACT_THRESHOLD=0.1
@@ -120,6 +124,22 @@ while [[ $# -gt 0 ]]; do
             SHARED_NOISE_BASE="$2"
             shift 2
             ;;
+        --position-decoder-particles-aggregation)
+            POSITION_DECODER_PARTICLES_AGGREGATION="$2"
+            shift 2
+            ;;
+        --use-film-conditioning)
+            USE_FILM_CONDITIONING=true
+            shift
+            ;;
+        --film-hidden-dim)
+            FILM_HIDDEN_DIM="$2"
+            shift 2
+            ;;
+        --film-predict-scale)
+            FILM_PREDICT_SCALE=true
+            shift
+            ;;
         --contact-threshold)
             CONTACT_THRESHOLD="$2"
             shift 2
@@ -150,6 +170,12 @@ echo "Epochs: $EPOCHS"
 echo "WandB: $WANDB"
 echo "Use GT Reference: $USE_GT_REFERENCE"
 echo "Share Noise: $SHARE_NOISE"
+echo "Particles Aggregation: $POSITION_DECODER_PARTICLES_AGGREGATION"
+echo "Use FiLM Conditioning: $USE_FILM_CONDITIONING"
+if [ "$USE_FILM_CONDITIONING" = true ]; then
+    echo "FiLM Hidden Dim: $FILM_HIDDEN_DIM"
+    echo "FiLM Predict Scale: $FILM_PREDICT_SCALE"
+fi
 echo "=========================================="
 
 # Change to project directory
@@ -179,6 +205,7 @@ CMD_ARGS=(
     "--min-segment-length" "$MIN_SEGMENT_LENGTH"
     "--position-loss-coeff" "$POSITION_LOSS_COEFF"
     "--shared-noise-base" "$SHARED_NOISE_BASE"
+    "--position-decoder-particles-aggregation" "$POSITION_DECODER_PARTICLES_AGGREGATION"
 )
 
 # Add conditional flags
@@ -192,6 +219,14 @@ fi
 
 if [ "$USE_GT_REFERENCE" = true ]; then
     CMD_ARGS+=("--use-gt-reference-for-local-policy")
+fi
+
+if [ "$USE_FILM_CONDITIONING" = true ]; then
+    CMD_ARGS+=("--use-film-conditioning")
+    CMD_ARGS+=("--film-hidden-dim" "$FILM_HIDDEN_DIM")
+    if [ "$FILM_PREDICT_SCALE" = true ]; then
+        CMD_ARGS+=("--film-predict-scale")
+    fi
 fi
 
 # Add wandb flag if enabled

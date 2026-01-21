@@ -18,6 +18,10 @@ NUM_ENVS=64
 MAX_STEPS=300
 DEVICE=""
 OUT_PATH=""
+POSITION_DECODER_PARTICLES_AGGREGATION="median"
+USE_FILM_CONDITIONING="false"
+FILM_HIDDEN_DIM=64
+FILM_PREDICT_SCALE="true"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -39,6 +43,22 @@ while [[ $# -gt 0 ]]; do
             ;;
         --out-path)
             OUT_PATH="$2"
+            shift 2
+            ;;
+        --position-decoder-particles-aggregation)
+            POSITION_DECODER_PARTICLES_AGGREGATION="$2"
+            shift 2
+            ;;
+        --use-film-conditioning)
+            USE_FILM_CONDITIONING="$2"
+            shift 2
+            ;;
+        --film-hidden-dim)
+            FILM_HIDDEN_DIM="$2"
+            shift 2
+            ;;
+        --film-predict-scale)
+            FILM_PREDICT_SCALE="$2"
             shift 2
             ;;
         *)
@@ -68,6 +88,8 @@ echo "=========================================="
 echo "Checkpoint: $CKPT_PATH"
 echo "Number of Environments: $NUM_ENVS"
 echo "Max Steps: $MAX_STEPS"
+echo "Particles Aggregation: $POSITION_DECODER_PARTICLES_AGGREGATION"
+echo "Use FiLM Conditioning: $USE_FILM_CONDITIONING"
 if [ -n "$DEVICE" ]; then
     echo "Device: $DEVICE"
 fi
@@ -92,6 +114,8 @@ CMD_ARGS=(
     "--ckpt-path" "$CKPT_PATH"
     "--num-envs" "$NUM_ENVS"
     "--max-steps" "$MAX_STEPS"
+    "--position-decoder-particles-aggregation" "$POSITION_DECODER_PARTICLES_AGGREGATION"
+    "--use-film-conditioning" "$USE_FILM_CONDITIONING"
 )
 
 # Add optional arguments
@@ -102,6 +126,10 @@ fi
 if [ -n "$OUT_PATH" ]; then
     CMD_ARGS+=("--out-path" "$OUT_PATH")
 fi
+
+# Add FiLM arguments if provided
+CMD_ARGS+=("--film-hidden-dim" "$FILM_HIDDEN_DIM")
+CMD_ARGS+=("--film-predict-scale" "$FILM_PREDICT_SCALE")
 
 # Run evaluation
 echo "Running: python ${CMD_ARGS[*]}"

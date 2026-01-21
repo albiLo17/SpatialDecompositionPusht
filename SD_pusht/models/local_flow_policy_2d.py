@@ -32,6 +32,76 @@ except ImportError:
         return data
 
 
+class FiLMReEncoder2D(nn.Module):
+    """
+    FiLM (Feature-wise Linear Modulation) reencoder for 2D position conditioning.
+    
+    Adapts the encoded observation features based on the reference position using
+    multiplicative (scale) and additive (bias) conditioning.
+    Similar to FiLMReEncoder in spatialdecomposition but for 2D positions.
+    """
+    
+    def __init__(
+        self,
+        feature_dim: int,
+        position_dim: int = 2,
+        hidden_dim: int = 32,
+        predict_scale: bool = True,
+    ):
+        """
+        Args:
+            feature_dim: Dimension of the feature vector to be conditioned
+            position_dim: Dimension of the position (2 for 2D)
+            hidden_dim: Hidden dimension for the position encoder MLP
+            predict_scale: If True, predict both scale and bias (full FiLM).
+                          If False, only predict bias (additive conditioning only).
+        """
+        super().__init__()
+        
+        self.predict_scale = predict_scale
+        self.cond_channels = feature_dim
+        if predict_scale:
+            self.cond_channels *= 2  # Need 2x channels for scale and bias
+        
+        self.position_encoder = nn.Sequential(
+            nn.Linear(position_dim, hidden_dim),
+            nn.Mish(),
+            nn.Linear(hidden_dim, self.cond_channels),
+        )
+    
+    def forward(self, features: torch.Tensor, conditioning_position: torch.Tensor) -> torch.Tensor:
+        """
+        Apply FiLM conditioning to features based on position.
+        
+        Args:
+            features: Feature vector to condition, shape (B, feature_dim)
+            conditioning_position: Reference position, shape (B, position_dim)
+        
+        Returns:
+            Conditioned features, shape (B, feature_dim)
+        """
+        cond_params = self.position_encoder(conditioning_position)  # (B, cond_channels)
+        
+        if self.predict_scale:
+            cond_params = cond_params.reshape(
+                cond_params.shape[:-1] + (2, self.cond_channels // 2)
+            )  # (B, 2, feature_dim)
+            scale = cond_params[:, 0, :]  # (B, feature_dim)
+            bias = cond_params[:, 1, :]   # (B, feature_dim)
+            
+            assert scale.shape == features.shape, \
+                f"Scale shape {scale.shape} != features shape {features.shape}"
+        else:
+            scale = 1.0
+            bias = cond_params
+        
+        assert bias.shape == features.shape, \
+            f"Bias shape {bias.shape} != features shape {features.shape}"
+        
+        out = scale * features + bias
+        return out
+
+
 class ObservationEncoder(nn.Module):
     """
     Simple MLP encoder for observations.
@@ -298,6 +368,7 @@ class Position2DFlowDecoder(nn.Module):
         mlp_activation: str = "mish",
         use_flow_matching: bool = True,
         num_particles: int = 1,
+        particles_aggregation: str = "median",  # "median" or "knn"
     ):
         """
         Args:
@@ -312,7 +383,10 @@ class Position2DFlowDecoder(nn.Module):
             mlp_activation: Activation function for MLP ("mish", "relu", "gelu", "tanh")
             use_flow_matching: If False, use direct regression instead of flow matching (only works with "mlp" backbone)
             num_particles: Number of particles to sample for position prediction (only used if use_flow_matching=True).
-                If > 1, samples multiple positions and returns the median. Default: 1 (single sample).
+                If > 1, samples multiple positions and aggregates them. Default: 1 (single sample).
+            particles_aggregation: Method to aggregate particles when num_particles > 1.
+                Options: "median" (element-wise median) or "knn" (KNN-based density estimation).
+                Default: "median".
         """
         super().__init__()
         
@@ -321,6 +395,13 @@ class Position2DFlowDecoder(nn.Module):
         self.backbone = backbone.lower()
         self.use_flow_matching = use_flow_matching
         self.num_particles = num_particles
+        self.particles_aggregation = particles_aggregation
+        
+        if particles_aggregation not in ["median", "knn"]:
+            raise ValueError(
+                f"Unknown particles_aggregation method: {particles_aggregation}. "
+                f"Must be 'median' or 'knn'."
+            )
         
         # Handle direct MLP (no flow matching)
         if self.backbone == "mlp_direct" or (self.backbone == "mlp" and not use_flow_matching):
@@ -442,10 +523,44 @@ class Position2DFlowDecoder(nn.Module):
                     all_positions.append(particle_position)
             
             # Stack all particle positions: (num_particles, B, POSITION_DIM)
-            all_positions = torch.stack(all_positions, dim=0)
+            all_positions = torch.stack(all_positions, dim=0)  # (num_particles, B, POSITION_DIM)
             
-            # Take median across particles: (B, POSITION_DIM)
-            position = torch.median(all_positions, dim=0)[0]
+            # Aggregate particles based on method
+            if self.particles_aggregation == "median":
+                # Element-wise median across particles: (B, POSITION_DIM)
+                position = torch.median(all_positions, dim=0)[0]
+            elif self.particles_aggregation == "knn":
+                # KNN-based density estimation
+                # Transpose to (B, num_particles, POSITION_DIM) for easier batch processing
+                all_positions_bt = all_positions.transpose(0, 1)  # (B, num_particles, POSITION_DIM)
+                B, P, _ = all_positions_bt.shape
+                
+                # Calculate pairwise euclidean distances: (B, num_particles, num_particles)
+                euclidean_distances = torch.norm(
+                    (all_positions_bt[:, :, None, :] - all_positions_bt[:, None, :, :]),
+                    dim=-1,
+                    p=2,
+                )
+                
+                # Exclude self-distances (set diagonal to inf for proper KNN density estimation)
+                mask = torch.eye(P, device=euclidean_distances.device, dtype=torch.bool).unsqueeze(0)  # (1, P, P)
+                euclidean_distances = euclidean_distances.masked_fill(mask, float('inf'))  # (B, P, P)
+                
+                # For each particle, find k=P//2 nearest neighbors
+                # Then pick the particle with smallest mean distance to its neighbors
+                k = max(1, P // 2)  # Use at least 1 neighbor
+                particle_idx = (
+                    euclidean_distances.topk(k=k, dim=-1, sorted=False, largest=False)[0]  # (B, num_particles, k)
+                    .mean(dim=-1)  # Mean distance to k nearest neighbors: (B, num_particles)
+                    .argmin(dim=-1)  # Pick particle with smallest mean: (B,)
+                )
+                
+                # Select the chosen particle for each batch element
+                position = all_positions_bt[range(all_positions_bt.shape[0]), particle_idx]  # (B, POSITION_DIM)
+            else:
+                raise ValueError(
+                    f"Unknown particles_aggregation method: {self.particles_aggregation}"
+                )
             
             return position
         
@@ -579,6 +694,7 @@ class LocalFlowPolicy2D(FlowMatching):
         position_decoder_n_groups: int = 4,
         position_decoder_fm_timesteps: int = 8,
         position_decoder_num_particles: int = 1,
+        position_decoder_particles_aggregation: str = "median",  # "median" or "knn"
         # Loss coefficients
         position_loss_coeff: float = 1.0,
         # Noise sharing
@@ -588,6 +704,10 @@ class LocalFlowPolicy2D(FlowMatching):
         use_gt_reference_for_local_policy: bool = False,
         # Transform observations to local frame (relative to reference position)
         transform_obs_to_local_frame: bool = False,
+        # FiLM conditioning: use FiLM (Feature-wise Linear Modulation) for position conditioning
+        use_film_conditioning: bool = False,
+        film_hidden_dim: int = 32,
+        film_predict_scale: bool = True,
     ):
         """
         Args:
@@ -606,7 +726,10 @@ class LocalFlowPolicy2D(FlowMatching):
             position_decoder_n_groups: Number of groups for position decoder GroupNorm
             position_decoder_fm_timesteps: Number of timesteps for position decoder inference
             position_decoder_num_particles: Number of particles to sample for position prediction.
-                If > 1, samples multiple positions and returns the median. Default: 1 (single sample).
+                If > 1, samples multiple positions and aggregates them. Default: 1 (single sample).
+            position_decoder_particles_aggregation: Method to aggregate particles when num_particles > 1.
+                Options: "median" (element-wise median) or "knn" (KNN-based density estimation).
+                Default: "median".
             position_loss_coeff: Overall coefficient for position loss
             share_noise: Whether to share noise between position and action predictions
             shared_noise_base: Base for noise sharing ("action", "position", or "combinatory")
@@ -617,6 +740,10 @@ class LocalFlowPolicy2D(FlowMatching):
             transform_obs_to_local_frame: If True, transform observations to local frame 
                 (relative to reference position) before using them. For PushT, this subtracts 
                 the reference position from agent_x, agent_y, block_x, block_y (first 4 dims).
+            use_film_conditioning: If True, use FiLM (Feature-wise Linear Modulation) to condition
+                observation features with reference position. Otherwise, use concatenation (default).
+            film_hidden_dim: Hidden dimension for FiLM position encoder MLP
+            film_predict_scale: If True, FiLM predicts both scale and bias. If False, only bias.
         """
         super().__init__(
             act_dim=act_dim,
@@ -637,6 +764,7 @@ class LocalFlowPolicy2D(FlowMatching):
         self.position_loss_coeff = position_loss_coeff
         self.use_gt_reference_for_local_policy = use_gt_reference_for_local_policy
         self.transform_obs_to_local_frame = transform_obs_to_local_frame
+        self.use_film_conditioning = use_film_conditioning
         
         # Create shared observation encoder
         obs_flat_dim = obs_horizon * obs_dim
@@ -646,6 +774,17 @@ class LocalFlowPolicy2D(FlowMatching):
             output_dim=self.obs_encoder_dim,
             activation="mish",
         )
+        
+        # Create FiLM reencoder if enabled
+        if use_film_conditioning:
+            self.pose_reencoder = FiLMReEncoder2D(
+                feature_dim=self.obs_encoder_dim,
+                position_dim=2,  # 2D position (x, y)
+                hidden_dim=film_hidden_dim,
+                predict_scale=film_predict_scale,
+            )
+        else:
+            self.pose_reencoder = None
         
         if use_position_decoder:
             # Position decoder now uses encoded observations
@@ -657,15 +796,23 @@ class LocalFlowPolicy2D(FlowMatching):
                 down_dims=position_decoder_down_dims,
                 n_groups=position_decoder_n_groups,
                 num_particles=position_decoder_num_particles,
+                particles_aggregation=position_decoder_particles_aggregation,
             )
-            # Recreate noise_pred_net with increased global_cond_dim to include reference position
-            # The local policy should be aware of the predicted reference frame
+            # Recreate noise_pred_net
+            # If using FiLM, global_cond_dim is just obs_encoder_dim (position is modulated into features)
+            # Otherwise, global_cond_dim is obs_encoder_dim + 2 (position is concatenated)
             REF_POSITION_DIM = 2  # 2D reference position (x, y)
+            if use_film_conditioning:
+                # With FiLM, position is modulated into features, so global_cond_dim is just obs_encoder_dim
+                noise_cond_dim = self.obs_encoder_dim
+            else:
+                # Without FiLM, concatenate position with obs encoding
+                noise_cond_dim = self.obs_encoder_dim + REF_POSITION_DIM
             # Apply same default as parent class if down_dims is None
             noise_net_down_dims = down_dims if down_dims is not None else [256, 512, 1024]
             self.noise_pred_net = ConditionalUnet1D(
                 input_dim=self.act_dim,
-                global_cond_dim=self.obs_encoder_dim + REF_POSITION_DIM,  # Use encoded obs + reference position
+                global_cond_dim=noise_cond_dim,
                 diffusion_step_embed_dim=diffusion_step_embed_dim,
                 down_dims=noise_net_down_dims,
                 n_groups=n_groups,
@@ -841,11 +988,14 @@ class LocalFlowPolicy2D(FlowMatching):
                     (B, self.pred_horizon, self.act_dim), device=device
                 )
             
-            # Prepare conditioning: concatenate encoded observation with reference position
-            # The local policy should be aware of the predicted reference frame
+            # Prepare conditioning: use FiLM if enabled, otherwise concatenate
             if self.use_position_decoder:
-                # Concatenate obs_cond with ref_position for local action prediction
-                action_cond = torch.cat([obs_cond, ref_position], dim=-1)  # (B, obs_encoder_dim + 2)
+                if self.use_film_conditioning:
+                    # Use FiLM to condition observation features with reference position
+                    action_cond = self.pose_reencoder(obs_cond, ref_position)  # (B, obs_encoder_dim)
+                else:
+                    # Concatenate obs_cond with ref_position for local action prediction
+                    action_cond = torch.cat([obs_cond, ref_position], dim=-1)  # (B, obs_encoder_dim + 2)
             else:
                 action_cond = obs_cond
             
@@ -977,6 +1127,10 @@ class LocalFlowPolicy2D(FlowMatching):
         obs_flat_local = obs_seq_local.flatten(start_dim=1)  # (B, obs_horizon * obs_dim)
         obs_cond = self.obs_encoder(obs_flat_local)  # (B, obs_encoder_dim)
         
+        # Apply FiLM conditioning if enabled (before action transformation)
+        if self.use_position_decoder and self.use_film_conditioning and world_ref_position_for_conditioning is not None:
+            obs_cond = self.pose_reencoder(obs_cond, world_ref_position_for_conditioning)  # (B, obs_encoder_dim)
+        
         # Transform world actions to local frame
         # Steps: unnormalize world actions → transform to local frame → normalize local actions
         if world_ref_position_for_transform is not None and action_stats is not None and reference_pos_stats is not None:
@@ -1016,11 +1170,15 @@ class LocalFlowPolicy2D(FlowMatching):
         # Sample location along path and get conditional flow
         timestep, xt, ut = self.FM.sample_location_and_conditional_flow(x0, local_action_seq)
         
-        # Prepare conditioning: concatenate encoded observation with reference position
+        # Prepare conditioning: use FiLM if enabled (already applied above), otherwise concatenate
         # The local policy should be aware of the reference frame (GT in oracle mode, predicted otherwise)
         if self.use_position_decoder and world_ref_position_for_conditioning is not None:
-            # Concatenate obs_cond with reference position for local action prediction
-            action_cond = torch.cat([obs_cond, world_ref_position_for_conditioning], dim=-1)  # (B, obs_encoder_dim + 2)
+            if not self.use_film_conditioning:
+                # Concatenate obs_cond with reference position for local action prediction
+                action_cond = torch.cat([obs_cond, world_ref_position_for_conditioning], dim=-1)  # (B, obs_encoder_dim + 2)
+            else:
+                # FiLM already applied above, use obs_cond directly
+                action_cond = obs_cond
         else:
             action_cond = obs_cond
         
