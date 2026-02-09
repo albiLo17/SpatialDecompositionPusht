@@ -3,7 +3,6 @@ __pycache__/
 .vscode/
 datasets/
 pusht_demos_npz/
-scripts/
 log/
 logs/
 logs_berzelius/
