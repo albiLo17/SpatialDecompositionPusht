@@ -1,7 +1,9 @@
 # all pycache files
 __pycache__/
 .vscode/
-datasets/
+datasets/*.h5
+datasets/*.npz
+datasets/*.zip
 pusht_demos_npz/
 log/
 logs/
