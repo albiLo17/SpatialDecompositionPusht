@@ -22,6 +22,7 @@ POSITION_DECODER_PARTICLES_AGGREGATION="median"
 USE_FILM_CONDITIONING="false"
 FILM_HIDDEN_DIM=64
 FILM_PREDICT_SCALE="true"
+DISABLE_REFERENCE_CONDITIONING="false"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -61,6 +62,10 @@ while [[ $# -gt 0 ]]; do
             FILM_PREDICT_SCALE="$2"
             shift 2
             ;;
+        --disable-reference-conditioning)
+            DISABLE_REFERENCE_CONDITIONING="true"
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
             shift
@@ -90,6 +95,7 @@ echo "Number of Environments: $NUM_ENVS"
 echo "Max Steps: $MAX_STEPS"
 echo "Particles Aggregation: $POSITION_DECODER_PARTICLES_AGGREGATION"
 echo "Use FiLM Conditioning: $USE_FILM_CONDITIONING"
+echo "Disable Reference Conditioning: $DISABLE_REFERENCE_CONDITIONING"
 if [ -n "$DEVICE" ]; then
     echo "Device: $DEVICE"
 fi
@@ -130,6 +136,11 @@ fi
 # Add FiLM arguments if provided
 CMD_ARGS+=("--film-hidden-dim" "$FILM_HIDDEN_DIM")
 CMD_ARGS+=("--film-predict-scale" "$FILM_PREDICT_SCALE")
+
+# Add conditional flags
+if [ "$DISABLE_REFERENCE_CONDITIONING" = "true" ]; then
+    CMD_ARGS+=("--disable-reference-conditioning")
+fi
 
 # Run evaluation
 echo "Running: python ${CMD_ARGS[*]}"

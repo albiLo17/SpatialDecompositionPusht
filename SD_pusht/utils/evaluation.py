@@ -422,6 +422,80 @@ def visualize_training_trajectory(
     }
 
 
+def _draw_particles_on_frame(frame, all_particles, selected_index, stats=None, 
+                             particle_color=(100, 100, 255), selected_color=(0, 255, 0), 
+                             particle_radius=5, selected_radius=10):
+    """Draw all particles and highlight the selected one on frame.
+    
+    Args:
+        frame: Image frame, shape (H, W, 3) as uint8 (RGB)
+        all_particles: All particle positions in normalized coordinates, shape (num_particles, 2)
+        selected_index: Index of selected particle (None if no selection)
+        stats: Dataset stats for unnormalization (required for proper mapping)
+        particle_color: RGB color for regular particles (will convert to BGR for OpenCV)
+        selected_color: RGB color for selected particle (will convert to BGR for OpenCV)
+        particle_radius: Radius of regular particle markers
+        selected_radius: Radius of selected particle marker
+    
+    Returns:
+        Frame with particles drawn (RGB)
+    """
+    if frame is None or all_particles is None:
+        return frame
+    
+    frame = frame.copy()
+    H, W = frame.shape[:2]
+    
+    # Unnormalize particles using stats
+    if stats is not None and "obs" in stats:
+        agent_stats = {
+            'min': stats["obs"]['min'][0:2],
+            'max': stats["obs"]['max'][0:2],
+        }
+        # Unnormalize from [-1, 1] back to original range [0, 512]
+        particles_unnorm = unnormalize_data(all_particles, agent_stats)
+    else:
+        particles_unnorm = all_particles
+    
+    # Convert RGB to BGR for OpenCV
+    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    
+    # Convert particle colors from RGB to BGR
+    particle_color_bgr = (particle_color[2], particle_color[1], particle_color[0])
+    selected_color_bgr = (selected_color[2], selected_color[1], selected_color[0])
+    
+    # Draw all particles
+    num_particles = len(particles_unnorm)
+    for i, particle_pos in enumerate(particles_unnorm):
+        x_pixel, y_pixel = world_to_pixel(particle_pos, swap_xy=False, flip_y=False)
+        
+        # Scale to actual image dimensions if different from 512
+        x_pixel = int(x_pixel * (W / 512.0))
+        y_pixel = int(y_pixel * (H / 512.0))
+        
+        # Clamp to image bounds
+        x_pixel = max(0, min(W - 1, x_pixel))
+        y_pixel = max(0, min(H - 1, y_pixel))
+        
+        # Draw particle
+        if selected_index is not None and i == selected_index:
+            # Highlight selected particle (green, larger)
+            cv2.circle(frame_bgr, (x_pixel, y_pixel), selected_radius, selected_color_bgr, -1)
+            cv2.circle(frame_bgr, (x_pixel, y_pixel), selected_radius, (255, 255, 255), 2)  # White border
+            # Add label
+            cv2.putText(frame_bgr, f"S{i}", 
+                       (x_pixel + selected_radius + 2, y_pixel),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, selected_color_bgr, 2)
+        else:
+            # Regular particle (blue, smaller)
+            cv2.circle(frame_bgr, (x_pixel, y_pixel), particle_radius, particle_color_bgr, -1)
+            cv2.circle(frame_bgr, (x_pixel, y_pixel), particle_radius, (255, 255, 255), 1)  # White border
+    
+    # Convert back to RGB
+    frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    return frame
+
+
 def _draw_reference_position(frame, ref_pos, stats=None, color=(255, 0, 0), radius=8):
     """Draw reference position on frame.
     
@@ -499,6 +573,10 @@ def evaluate_local_flow_2d(
     device=None,
     save_video=True,
     eval_seed=None,
+    eval_input_noise_std=0.0,
+    k_clusters=None,
+    visualize_particles=False,
+    particles_output_dir=None,
 ):
     """
     Evaluate a LocalFlowPolicy2D model on `num_envs` parallel PushTEnv environments.
@@ -514,6 +592,14 @@ def evaluate_local_flow_2d(
       device: torch.device or None (will infer from model parameters).
       save_video: whether to save video to disk.
       eval_seed: Random seed for environment initialization (None = use fixed seeds).
+      eval_input_noise_std: Standard deviation of Gaussian noise to add to observations during evaluation.
+        This is separate from the model's input_noise_std parameter (which should be 0 for evaluation).
+        Default: 0.0 (no noise).
+      k_clusters: Optional number of nearest neighbors for KNN aggregation (only used if particles_aggregation="knn").
+        If None, uses default k = max(1, P // 2) where P is num_particles. Default: None (backward compatible).
+      visualize_particles: If True, visualize all particles and selected one for the first environment.
+        Saves images at each action prediction to particles_output_dir. Default: False (backward compatible).
+      particles_output_dir: Directory to save particle visualization images (only used if visualize_particles=True).
     Returns:
       dict with summary: mean_score, max_score, success_rate, steps_done, video_frames
       video_frames: numpy array of shape (T, H, W, C) for wandb logging (from first env only)
@@ -549,6 +635,13 @@ def evaluate_local_flow_2d(
     # Store reference positions for visualization (only for first env)
     current_ref_pos = None
     action_step_counter = 0  # Track steps within current action horizon
+    
+    # Particle visualization (only for first env)
+    particle_step_counter = 0  # Track steps for particle visualization
+    stored_particles_info = None  # Store particles info for current step
+    max_variance_info = {'value': -1.0, 'image': None}  # Track maximum variance seen (use dict for mutability)
+    if visualize_particles and particles_output_dir:
+        os.makedirs(particles_output_dir, exist_ok=True)
 
     # visualization frames: list[T] where each element is list[B] frames
     # We only save frames from the first environment to save memory
@@ -584,6 +677,8 @@ def evaluate_local_flow_2d(
                         obs_seq=nobs_t,
                         action_stats=stats.get("action") if stats else None,
                         reference_pos_stats=reference_pos_stats,
+                        k_clusters=k_clusters,
+                        return_particles=visualize_particles,
                     )
                     action_pred = action_dict["actions"]  # (B, action_horizon, action_dim) - UNNORMALIZED
                     ref_pos_pred = action_dict["reference_pos"]  # (B, 2) - normalized
@@ -591,6 +686,30 @@ def evaluate_local_flow_2d(
                     # Store reference position for first env (for visualization)
                     if ref_pos_pred is not None:
                         current_ref_pos = ref_pos_pred[0].detach().cpu().numpy()
+                    
+                    # Get particles info for visualization (first env only)
+                    stored_particles_info = None
+                    if visualize_particles and "particles_info" in action_dict:
+                        particles_info = action_dict["particles_info"]
+                        # Extract first environment's particles
+                        if particles_info.get("particles") is not None:
+                            # particles shape: (B, num_particles, 2)
+                            particles_first_env = particles_info["particles"][0].detach().cpu().numpy()  # (num_particles, 2)
+                            selected_idx = None
+                            if particles_info.get("selected_index") is not None:
+                                selected_idx = particles_info["selected_index"][0].item()
+                            
+                            # Calculate variance of particle positions
+                            # Variance across both x and y dimensions
+                            particle_variance = np.var(particles_first_env, axis=0).sum()  # Sum of variances in x and y
+                            
+                            # Store particles info for visualization after rendering
+                            stored_particles_info = {
+                                'particles': particles_first_env,
+                                'selected_index': selected_idx,
+                                'variance': particle_variance
+                            }
+                            particle_step_counter += 1
                     
                     # Actions are already unnormalized, just convert to numpy
                     action_chunk = action_pred.detach().cpu().numpy()  # (B, H, A) - unnormalized
@@ -641,12 +760,48 @@ def evaluate_local_flow_2d(
                 frames_all.append([np.asarray(f, dtype=np.uint8) if f is not None else None for f in frames])
                 # Save first env frame for single video (for wandb) with reference position
                 if frames[0] is not None:
+                    frame_first = np.asarray(frames[0], dtype=np.uint8)
+                    
+                    # Draw particles if available (only at start of action horizon)
+                    if visualize_particles and stored_particles_info is not None and action_step_counter == 0:
+                        frame_first = _draw_particles_on_frame(
+                            frame=frame_first,
+                            all_particles=stored_particles_info['particles'],
+                            selected_index=stored_particles_info['selected_index'],
+                            stats=stats,
+                        )
+                        
+                        # Save particle visualization image
+                        if particles_output_dir:
+                            particle_image_path = os.path.join(
+                                particles_output_dir, 
+                                f"particles_step_{particle_step_counter-1:04d}.png"
+                            )
+                            plt.imsave(particle_image_path, frame_first)
+                            
+                            # Track highest variance image
+                            current_variance = stored_particles_info.get('variance', 0.0)
+                            if current_variance > max_variance_info['value']:
+                                max_variance_info['value'] = current_variance
+                                max_variance_info['image'] = frame_first.copy()
+                                # Save/update highest variance image
+                                highest_variance_path = os.path.join(
+                                    particles_output_dir,
+                                    "highest_variance.png"
+                                )
+                                plt.imsave(highest_variance_path, max_variance_info['image'])
+                                print(f"Updated highest variance image: variance={current_variance:.4f}")
+                            
+                            # Clear stored particles info after visualization
+                            stored_particles_info = None
+                    
+                    # Draw reference position
                     frame_with_ref = _draw_reference_position(
-                        np.asarray(frames[0], dtype=np.uint8),
+                        frame_first,
                         current_ref_pos if current_ref_pos is not None else np.array([0.0, 0.0]),
                         stats=stats
                     )
-                    frames_single_env.append(frame_with_ref if frame_with_ref is not None else np.asarray(frames[0], dtype=np.uint8))
+                    frames_single_env.append(frame_with_ref if frame_with_ref is not None else frame_first)
 
             steps_done += 1
             action_step_counter = (action_step_counter + 1) % action_horizon

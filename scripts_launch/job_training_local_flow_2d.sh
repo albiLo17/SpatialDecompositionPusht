@@ -38,6 +38,7 @@ SHARED_NOISE_BASE="action"
 USE_FILM_CONDITIONING=false
 FILM_HIDDEN_DIM=64
 FILM_PREDICT_SCALE=true
+DISABLE_REFERENCE_CONDITIONING=false
 
 # Dataset segmentation arguments
 CONTACT_THRESHOLD=0.1
@@ -176,6 +177,7 @@ if [ "$USE_FILM_CONDITIONING" = true ]; then
     echo "FiLM Hidden Dim: $FILM_HIDDEN_DIM"
     echo "FiLM Predict Scale: $FILM_PREDICT_SCALE"
 fi
+echo "Disable Reference Conditioning: $DISABLE_REFERENCE_CONDITIONING"
 echo "=========================================="
 
 # Change to project directory
@@ -209,6 +211,9 @@ CMD_ARGS=(
 )
 
 # Add conditional flags
+if [ "$DISABLE_REFERENCE_CONDITIONING" = true ]; then
+    CMD_ARGS+=("--disable-reference-conditioning")
+fi
 if [ "$USE_POSITION_DECODER" = true ]; then
     CMD_ARGS+=("--use-position-decoder")
 fi
