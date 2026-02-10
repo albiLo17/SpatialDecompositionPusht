@@ -28,6 +28,7 @@ import gdown
 from SD_pusht.models import LocalFlowPolicy2D
 from SD_pusht.datasets import PushTSegmentedDatasetSimple
 from SD_pusht.utils.evaluation import evaluate_local_flow_2d, visualize_training_trajectory, visualize_action_predictions, visualize_position_predictions
+from SD_pusht.utils.evaluation_softgym import evaluate_local_flow_3d_softgym
 
 
 def parse_args():
@@ -57,8 +58,10 @@ def parse_args():
                        help="Action horizon")
     parser.add_argument("--obs-dim", type=int, default=5,
                        help="Observation dimension")
-    parser.add_argument("--action-dim", type=int, default=2,
-                       help="Action dimension")
+    parser.add_argument("--action-dim", type=int, default=None,
+                       help="Action dimension (if None, will be computed as 4 * num_pickers)")
+    parser.add_argument("--num-pickers", type=int, default=2,
+                       help="Number of grippers/pickers (default: 2)")
     parser.add_argument("--fm-timesteps", type=int, default=100,
                        help="Number of timesteps for flow matching inference")
     parser.add_argument("--sigma", type=float, default=0.0,
@@ -124,6 +127,15 @@ def parse_args():
                        help="Minimum number of episodes for validation set (will use from training if needed)")
     parser.add_argument("--eval-sample-seed", type=int, default=None,
                        help="Random seed for selecting evaluation sample (None = use epoch number)")
+    # SoftGym evaluation arguments
+    parser.add_argument("--eval-env-name", type=str, default=None,
+                       help="SoftGym environment name for evaluation (e.g., RopeFlatten). If None, will try to infer from dataset.")
+    parser.add_argument("--eval-env-horizon", type=int, default=None,
+                       help="Environment horizon for evaluation (overrides default)")
+    parser.add_argument("--eval-num-envs", type=int, default=16,
+                       help="Number of parallel environments for evaluation")
+    parser.add_argument("--eval-max-steps", type=int, default=300,
+                       help="Maximum steps per episode for evaluation")
     return parser.parse_args()
 
 
@@ -182,21 +194,43 @@ if __name__ == "__main__":
         id = "1KY1InLurpMvJDRb14L9NlXT_fEsCvVUq&confirm=t"
         gdown.download(id=id, output=dataset_path, quiet=False)
 
-    # Load dataset info to get total number of episodes
+    # Load dataset info to get total number of episodes and metadata
     import zarr
     dataset_root = zarr.open(dataset_path, 'r')
     all_episode_ends = dataset_root['meta']['episode_ends'][:]
     total_episodes = len(all_episode_ends)
+    meta = dataset_root['meta']
+    dataset_num_pickers = int(meta.attrs.get('num_picker', args.num_pickers))
+    if dataset_num_pickers != args.num_pickers:
+        print(f"Warning: Dataset has {dataset_num_pickers} pickers, but --num-pickers={args.num_pickers}. Using dataset value: {dataset_num_pickers}")
+        args.num_pickers = dataset_num_pickers
+    
+    # Compute action_dim if not provided: 4 * num_pickers (dx, dy, dz, pick_flag per gripper)
+    if args.action_dim is None:
+        args.action_dim = 4 * args.num_pickers
+        print(f"Computed action_dim = {args.action_dim} (4 * {args.num_pickers} pickers)")
+    
+    # Verify action_dim matches expected format
+    expected_act_dim = 4 * args.num_pickers
+    if args.action_dim != expected_act_dim:
+        import warnings
+        warnings.warn(
+            f"action_dim ({args.action_dim}) does not match expected format for {args.num_pickers} pickers "
+            f"(expected: {expected_act_dim} = 4 * {args.num_pickers}). "
+            f"Actions should be [dx1, dy1, dz1, pick1, dx2, dy2, dz2, pick2, ...]"
+        )
     
     # create segmented training dataset from file (this will store demo_indices internally)
-    dataset = PushTSegmentedDatasetSimple(
+    # Use SoftGymSegmentedDatasetSimple for SoftGym datasets
+    from SD_pusht.datasets.softgym_segmented_dataset import SoftGymSegmentedDatasetSimple
+    dataset = SoftGymSegmentedDatasetSimple(
         dataset_path=dataset_path,
         pred_horizon=args.pred_horizon,
         obs_horizon=args.obs_horizon,
         action_horizon=args.action_horizon,
         max_demos=args.max_demos,  # Use max_demos as specified (keeps it fixed)
-        use_contact_segmentation=True,
-        contact_threshold=args.contact_threshold,
+        use_gripper_segmentation=True,  # Use gripper-based segmentation
+        use_contact_segmentation=False,
         min_segment_length=args.min_segment_length,
     )
     
@@ -230,14 +264,14 @@ if __name__ == "__main__":
         
         # Create validation dataset with specified demo indices
         try:
-            val_dataset = PushTSegmentedDatasetSimple(
+            val_dataset = SoftGymSegmentedDatasetSimple(
                 dataset_path=dataset_path,
                 pred_horizon=args.pred_horizon,
                 obs_horizon=args.obs_horizon,
                 action_horizon=args.action_horizon,
                 demo_indices=val_demo_indices,  # Pass demo indices directly
-                use_contact_segmentation=True,
-                contact_threshold=args.contact_threshold,
+                use_gripper_segmentation=True,  # Use gripper-based segmentation
+                use_contact_segmentation=False,
                 min_segment_length=args.min_segment_length,
             )
             print(f"Created validation dataset with {len(val_dataset)} samples from {len(val_demo_indices)} episodes")
@@ -251,12 +285,29 @@ if __name__ == "__main__":
     # save training data statistics
     stats = getattr(dataset, "stats", None)
     
-    # Create reference_pos_stats from obs stats (reference positions use same normalization as first 2 dims of obs)
+    # Create reference_pos_stats from obs stats (reference positions use same normalization as picker positions)
+    # For SoftGym: picker positions are at the end of obs (last 3*num_pickers dims)
+    # We use x, y, z (all 3 dims per picker) for reference positions
     reference_pos_stats = None
     if stats and "obs" in stats:
+        # Get picker positions from obs (last 3*num_pickers dims)
+        picker_start_idx = dataset.agent_state_dim - 3 * args.num_pickers
+        picker_x_indices = [picker_start_idx + i * 3 for i in range(args.num_pickers)]  # x indices
+        picker_y_indices = [picker_start_idx + i * 3 + 1 for i in range(args.num_pickers)]  # y indices
+        picker_z_indices = [picker_start_idx + i * 3 + 2 for i in range(args.num_pickers)]  # z indices
+        
+        # Get min/max for x, y, z across all pickers
+        x_mins = [stats["obs"]['min'][idx] for idx in picker_x_indices]
+        y_mins = [stats["obs"]['min'][idx] for idx in picker_y_indices]
+        z_mins = [stats["obs"]['min'][idx] for idx in picker_z_indices]
+        x_maxs = [stats["obs"]['max'][idx] for idx in picker_x_indices]
+        y_maxs = [stats["obs"]['max'][idx] for idx in picker_y_indices]
+        z_maxs = [stats["obs"]['max'][idx] for idx in picker_z_indices]
+        
+        # Use overall min/max across all pickers for normalization
         reference_pos_stats = {
-            'min': stats["obs"]['min'][:2],  # First 2 dims are agent position
-            'max': stats["obs"]['max'][:2],
+            'min': np.array([min(x_mins), min(y_mins), min(z_mins)]),  # Overall min (x, y, z)
+            'max': np.array([max(x_maxs), max(y_maxs), max(z_maxs)]),  # Overall max (x, y, z)
         }
 
     # create dataloader
@@ -275,6 +326,14 @@ if __name__ == "__main__":
     print("batch['obs'].shape:", batch['obs'].shape)
     print("batch['action'].shape", batch['action'].shape)
     print("batch['reference_pos'].shape", batch['reference_pos'].shape)
+    
+    # Verify reference_pos shape matches expected format
+    if batch['reference_pos'].shape[1] != args.num_pickers or batch['reference_pos'].shape[2] != 3:
+        raise ValueError(
+            f"Expected reference_pos shape (B, {args.num_pickers}, 3), "
+            f"but got {batch['reference_pos'].shape}. "
+            f"Make sure dataset uses use_gripper_segmentation=True and returns 3D positions."
+        )
 
     # create LocalFlowPolicy2D model
     agent = LocalFlowPolicy2D(
@@ -300,6 +359,7 @@ if __name__ == "__main__":
         film_predict_scale=args.film_predict_scale,
         # input_noise_std=args.input_noise_std,
         disable_reference_conditioning=args.disable_reference_conditioning,
+        num_pickers=args.num_pickers,  # Pass num_pickers to model
     ).to(device)
 
     num_epochs = args.epochs
@@ -334,6 +394,47 @@ if __name__ == "__main__":
     # Create checkpoint directory
     ckpt_dir = f"{args.output_dir}/{exp_name}/checkpoints"
     os.makedirs(ckpt_dir, exist_ok=True)
+    
+    # Initialize SoftGym environment once if needed (to avoid PyFlex reinitialization)
+    eval_env = None
+    if args.eval_every > 0 and args.eval_env_name is not None:
+        # Determine if this is a SoftGym dataset
+        is_softgym_eval = False
+        env_name = args.eval_env_name
+        try:
+            # Check if dataset has SoftGym metadata
+            if 'env_name' in meta.attrs:
+                is_softgym_eval = True
+                if env_name is None:
+                    env_name = str(meta.attrs['env_name'])
+        except Exception:
+            pass
+        
+        # If env_name is explicitly provided, assume SoftGym
+        if env_name is not None:
+            is_softgym_eval = True
+        
+        if is_softgym_eval:
+            print(f"Initializing SoftGym environment once for all evaluations...")
+            from SD_pusht.utils.evaluation_softgym import build_softgym_env
+            env_kwargs = {}
+            if args.eval_env_horizon is not None:
+                env_kwargs["horizon"] = args.eval_env_horizon
+            env_kwargs['num_variations'] = args.eval_num_envs
+            eval_seed = args.seed if args.eval_sample_seed is None else args.eval_sample_seed
+            try:
+                eval_env = build_softgym_env(
+                    env_name=env_name or "RopeFlatten",
+                    env_kwargs=env_kwargs if env_kwargs else None,
+                    seed=eval_seed,
+                    num_envs=args.eval_num_envs,
+                )
+                print(f"  ✓ Environment initialized successfully")
+            except Exception as e:
+                print(f"  ✗ Warning: Failed to initialize SoftGym environment: {e}")
+                import traceback
+                traceback.print_exc()
+                eval_env = None
 
     with tqdm(range(num_epochs), desc='Epoch') as tglobal:
         for epoch_idx in tglobal:
@@ -426,27 +527,83 @@ if __name__ == "__main__":
                     film_predict_scale=args.film_predict_scale,
                     # input_noise_std=args.input_noise_std,
                     disable_reference_conditioning=args.disable_reference_conditioning,
+                    num_pickers=args.num_pickers,  # Pass num_pickers to model
                 ).to(device)
                 
                 ema.copy_to(ema_model.parameters())
                 ema_model.eval()
                 print(f"Running evaluation at epoch {epoch_idx + 1}...")
                 
-                # Evaluate using the specialized evaluation function
+                # Determine if this is a SoftGym dataset
+                is_softgym = False
+                env_name = args.eval_env_name
+                try:
+                    # Check if dataset has SoftGym metadata
+                    if 'env_name' in meta.attrs:
+                        is_softgym = True
+                        if env_name is None:
+                            env_name = str(meta.attrs['env_name'])
+                except Exception:
+                    pass
+                
+                # If env_name is explicitly provided, assume SoftGym
+                if env_name is not None:
+                    is_softgym = True
+                
+                # Evaluate using the appropriate evaluation function
                 # Randomize evaluation seed based on epoch
                 eval_seed = args.seed + epoch_idx if args.eval_sample_seed is None else args.eval_sample_seed + epoch_idx
-                eval_results = evaluate_local_flow_2d(
-                    model=ema_model,
-                    stats=stats,
-                    out_path=f"{args.output_dir}/{exp_name}/eval_epoch_{epoch_idx + 1}.mp4",
-                    num_envs=64,
-                    max_steps=300,
-                    pred_horizon=args.pred_horizon,
-                    obs_horizon=args.obs_horizon,
-                    action_horizon=args.action_horizon,
-                    device=device,
-                    eval_seed=eval_seed,  # Pass seed for randomization
-                )
+                
+                if is_softgym:
+                    # Use SoftGym evaluation with pre-initialized environment
+                    env_kwargs = {}
+                    if args.eval_env_horizon is not None:
+                        env_kwargs["horizon"] = args.eval_env_horizon
+                    
+                    try:
+                        eval_results = evaluate_local_flow_3d_softgym(
+                            model=ema_model,
+                            stats=stats,
+                            env_name=env_name or "RopeFlatten",
+                            env_kwargs=env_kwargs if env_kwargs else None,
+                            out_path=f"{args.output_dir}/{exp_name}/eval_epoch_{epoch_idx + 1}.mp4",
+                            num_envs=args.eval_num_envs,
+                            max_steps=args.eval_max_steps,
+                            pred_horizon=args.pred_horizon,
+                            obs_horizon=args.obs_horizon,
+                            action_horizon=args.action_horizon,
+                            device=device,
+                            save_video=True,
+                            eval_seed=eval_seed,
+                            num_pickers=args.num_pickers,
+                            env=eval_env,  # Pass pre-initialized environment
+                        )
+                    except Exception as e:
+                        print(f"    ✗ Warning: Failed to evaluate SoftGym environment: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        # Use dummy results to continue training
+                        eval_results = {
+                            'success_rate': 0.0,
+                            'mean_score': 0.0,
+                            'max_score': 0.0,
+                            'mean_max_single_reward': 0.0,
+                            'video_path': None,
+                        }
+                else:
+                    # Use PushT evaluation (original)
+                    eval_results = evaluate_local_flow_2d(
+                        model=ema_model,
+                        stats=stats,
+                        out_path=f"{args.output_dir}/{exp_name}/eval_epoch_{epoch_idx + 1}.mp4",
+                        num_envs=args.eval_num_envs,
+                        max_steps=args.eval_max_steps,
+                        pred_horizon=args.pred_horizon,
+                        obs_horizon=args.obs_horizon,
+                        action_horizon=args.action_horizon,
+                        device=device,
+                        eval_seed=eval_seed,  # Pass seed for randomization
+                    )
                 
                 # Check if this is the best model so far
                 current_success_rate = eval_results['success_rate']
@@ -474,68 +631,140 @@ if __name__ == "__main__":
                 print(f"TRAINING SET EVALUATIONS (Epoch {epoch_idx + 1})")
                 print(f"{'='*60}")
                 
-                train_action_results = None
-                train_position_results = None
-                train_traj_results = None
-                
                 train_sample_idx = rng.randint(0, len(dataset))
                 print(f"  Sample index: {train_sample_idx}")
                 
-                # Evaluate action policy on training set
-                print(f"  Evaluating action policy...")
-                try:
-                    train_action_results = visualize_action_predictions(
-                        model=ema_model,
-                        dataset=dataset,
-                        stats=stats,
-                        sample_idx=train_sample_idx,
-                        out_path=f"{args.output_dir}/{exp_name}/eval_train_action_epoch_{epoch_idx + 1}.png",
-                        device=device,
+                if is_softgym:
+                    # Use SoftGym-specific visualizations
+                    from SD_pusht.utils.evaluation_softgym_vis import (
+                        visualize_action_predictions_softgym,
+                        visualize_position_predictions_softgym,
+                        visualize_training_trajectory_softgym,
                     )
-                    print(f"    ✓ Action error: {train_action_results.get('action_error', 0.0):.4f}")
-                    print(f"    ✓ Saved to: {train_action_results['image_path']}")
-                except Exception as e:
-                    print(f"    ✗ Warning: Failed to evaluate action policy: {e}")
-                    import traceback
-                    traceback.print_exc()
-                
-                # Evaluate position decoder (frame prediction) on training set
-                if ema_model.position_decoder is not None:
-                    print(f"  Evaluating position decoder (frame prediction)...")
+                    
+                    # Evaluate action policy on training set
+                    print(f"  Evaluating action policy (SoftGym)...")
                     try:
-                        train_position_results = visualize_position_predictions(
-                            model=ema_model,  # Pass full model so encoder is available
+                        train_action_results = visualize_action_predictions_softgym(
+                            model=ema_model,
+                            dataset=dataset,
+                            stats=stats,
+                            dataset_path=dataset_path,
+                            sample_idx=train_sample_idx,
+                            out_path=f"{args.output_dir}/{exp_name}/eval_train_action_epoch_{epoch_idx + 1}.png",
+                            device=device,
+                        )
+                        print(f"    ✓ Action error: {train_action_results.get('action_error', 0.0):.4f}")
+                        print(f"    ✓ Saved to: {train_action_results['image_path']}")
+                    except Exception as e:
+                        print(f"    ✗ Warning: Failed to evaluate action policy: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        train_action_results = None
+                    
+                    # Evaluate position decoder (frame prediction) on training set
+                    if ema_model.position_decoder is not None:
+                        print(f"  Evaluating position decoder (frame prediction) (SoftGym)...")
+                        try:
+                            train_position_results = visualize_position_predictions_softgym(
+                                model=ema_model,
+                                dataset=dataset,
+                                stats=stats,
+                                dataset_path=dataset_path,
+                                sample_idx=train_sample_idx,
+                                out_path=f"{args.output_dir}/{exp_name}/eval_train_position_epoch_{epoch_idx + 1}.png",
+                                device=device,
+                            )
+                            print(f"    ✓ Position error: {train_position_results.get('pred_error', 0.0):.4f}")
+                            print(f"    ✓ Saved to: {train_position_results['image_path']}")
+                        except Exception as e:
+                            print(f"    ✗ Warning: Failed to evaluate position decoder: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            train_position_results = None
+                    else:
+                        print(f"  Skipping position decoder evaluation (position decoder not available)")
+                        train_position_results = None
+                    
+                    # Visualize full trajectory on training set
+                    print(f"  Visualizing full trajectory (SoftGym)...")
+                    try:
+                        train_traj_results = visualize_training_trajectory_softgym(
+                            model=ema_model,
+                            dataset=dataset,
+                            stats=stats,
+                            dataset_path=dataset_path,
+                            sample_idx=train_sample_idx,
+                            out_path=f"{args.output_dir}/{exp_name}/eval_train_trajectory_epoch_{epoch_idx + 1}.png",
+                            device=device,
+                        )
+                        print(f"    ✓ Saved to: {train_traj_results['image_path']}")
+                    except Exception as e:
+                        print(f"    ✗ Warning: Failed to visualize trajectory: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        train_traj_results = None
+                else:
+                    # Use PushT-specific visualizations
+                    # Evaluate action policy on training set
+                    print(f"  Evaluating action policy...")
+                    try:
+                        train_action_results = visualize_action_predictions(
+                            model=ema_model,
                             dataset=dataset,
                             stats=stats,
                             sample_idx=train_sample_idx,
-                            out_path=f"{args.output_dir}/{exp_name}/eval_train_position_epoch_{epoch_idx + 1}.png",
+                            out_path=f"{args.output_dir}/{exp_name}/eval_train_action_epoch_{epoch_idx + 1}.png",
                             device=device,
                         )
-                        print(f"    ✓ Position error: {train_position_results.get('pred_error', 0.0):.4f}")
-                        print(f"    ✓ Saved to: {train_position_results['image_path']}")
+                        print(f"    ✓ Action error: {train_action_results.get('action_error', 0.0):.4f}")
+                        print(f"    ✓ Saved to: {train_action_results['image_path']}")
                     except Exception as e:
-                        print(f"    ✗ Warning: Failed to evaluate position decoder: {e}")
+                        print(f"    ✗ Warning: Failed to evaluate action policy: {e}")
                         import traceback
                         traceback.print_exc()
-                else:
-                    print(f"  Skipping position decoder evaluation (position decoder not available)")
-                
-                # Visualize full trajectory on training set
-                print(f"  Visualizing full trajectory...")
-                try:
-                    train_traj_results = visualize_training_trajectory(
-                        model=ema_model,
-                        dataset=dataset,
-                        stats=stats,
-                        sample_idx=train_sample_idx,
-                        out_path=f"{args.output_dir}/{exp_name}/eval_train_trajectory_epoch_{epoch_idx + 1}.png",
-                        device=device,
-                    )
-                    print(f"    ✓ Saved to: {train_traj_results['image_path']}")
-                except Exception as e:
-                    print(f"    ✗ Warning: Failed to visualize trajectory: {e}")
-                    import traceback
-                    traceback.print_exc()
+                        train_action_results = None
+                    
+                    # Evaluate position decoder (frame prediction) on training set
+                    if ema_model.position_decoder is not None:
+                        print(f"  Evaluating position decoder (frame prediction)...")
+                        try:
+                            train_position_results = visualize_position_predictions(
+                                model=ema_model,  # Pass full model so encoder is available
+                                dataset=dataset,
+                                stats=stats,
+                                sample_idx=train_sample_idx,
+                                out_path=f"{args.output_dir}/{exp_name}/eval_train_position_epoch_{epoch_idx + 1}.png",
+                                device=device,
+                            )
+                            print(f"    ✓ Position error: {train_position_results.get('pred_error', 0.0):.4f}")
+                            print(f"    ✓ Saved to: {train_position_results['image_path']}")
+                        except Exception as e:
+                            print(f"    ✗ Warning: Failed to evaluate position decoder: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            train_position_results = None
+                    else:
+                        print(f"  Skipping position decoder evaluation (position decoder not available)")
+                        train_position_results = None
+                    
+                    # Visualize full trajectory on training set
+                    print(f"  Visualizing full trajectory...")
+                    try:
+                        train_traj_results = visualize_training_trajectory(
+                            model=ema_model,
+                            dataset=dataset,
+                            stats=stats,
+                            sample_idx=train_sample_idx,
+                            out_path=f"{args.output_dir}/{exp_name}/eval_train_trajectory_epoch_{epoch_idx + 1}.png",
+                            device=device,
+                        )
+                        print(f"    ✓ Saved to: {train_traj_results['image_path']}")
+                    except Exception as e:
+                        print(f"    ✗ Warning: Failed to visualize trajectory: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        train_traj_results = None
                 
                 # ====================================================================
                 # VALIDATION SET EVALUATIONS
@@ -552,61 +781,137 @@ if __name__ == "__main__":
                     val_sample_idx = rng.randint(0, len(val_dataset))
                     print(f"  Sample index: {val_sample_idx}")
                     
-                    # Evaluate action policy on validation set
-                    print(f"  Evaluating action policy...")
-                    try:
-                        val_action_results = visualize_action_predictions(
-                            model=ema_model,
-                            dataset=val_dataset,
-                            stats=stats,
-                            sample_idx=val_sample_idx,
-                            out_path=f"{args.output_dir}/{exp_name}/eval_val_action_epoch_{epoch_idx + 1}.png",
-                            device=device,
+                    if is_softgym:
+                        # Use SoftGym-specific visualizations
+                        from SD_pusht.utils.evaluation_softgym_vis import (
+                            visualize_action_predictions_softgym,
+                            visualize_position_predictions_softgym,
+                            visualize_training_trajectory_softgym,
                         )
-                        print(f"    ✓ Action error: {val_action_results.get('action_error', 0.0):.4f}")
-                        print(f"    ✓ Saved to: {val_action_results['image_path']}")
-                    except Exception as e:
-                        print(f"    ✗ Warning: Failed to evaluate action policy: {e}")
-                        import traceback
-                        traceback.print_exc()
-                    
-                    # Evaluate position decoder (frame prediction) on validation set
-                    if ema_model.position_decoder is not None:
-                        print(f"  Evaluating position decoder (frame prediction)...")
+                        
+                        # Evaluate action policy on validation set
+                        print(f"  Evaluating action policy (SoftGym)...")
                         try:
-                            val_position_results = visualize_position_predictions(
-                                model=ema_model,  # Pass full model so encoder is available
+                            val_action_results = visualize_action_predictions_softgym(
+                                model=ema_model,
+                                dataset=val_dataset,
+                                stats=stats,
+                                dataset_path=dataset_path,
+                                sample_idx=val_sample_idx,
+                                out_path=f"{args.output_dir}/{exp_name}/eval_val_action_epoch_{epoch_idx + 1}.png",
+                                device=device,
+                            )
+                            print(f"    ✓ Action error: {val_action_results.get('action_error', 0.0):.4f}")
+                            print(f"    ✓ Saved to: {val_action_results['image_path']}")
+                        except Exception as e:
+                            print(f"    ✗ Warning: Failed to evaluate action policy: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            val_action_results = None
+                        
+                        # Evaluate position decoder (frame prediction) on validation set
+                        if ema_model.position_decoder is not None:
+                            print(f"  Evaluating position decoder (frame prediction) (SoftGym)...")
+                            try:
+                                val_position_results = visualize_position_predictions_softgym(
+                                    model=ema_model,
+                                    dataset=val_dataset,
+                                    stats=stats,
+                                    dataset_path=dataset_path,
+                                    sample_idx=val_sample_idx,
+                                    out_path=f"{args.output_dir}/{exp_name}/eval_val_position_epoch_{epoch_idx + 1}.png",
+                                    device=device,
+                                )
+                                print(f"    ✓ Position error: {val_position_results.get('pred_error', 0.0):.4f}")
+                                print(f"    ✓ Saved to: {val_position_results['image_path']}")
+                            except Exception as e:
+                                print(f"    ✗ Warning: Failed to evaluate position decoder: {e}")
+                                import traceback
+                                traceback.print_exc()
+                                val_position_results = None
+                        else:
+                            print(f"  Skipping position decoder evaluation (position decoder not available)")
+                            val_position_results = None
+                        
+                        # Visualize full trajectory on validation set
+                        print(f"  Visualizing full trajectory (SoftGym)...")
+                        try:
+                            val_traj_results = visualize_training_trajectory_softgym(
+                                model=ema_model,
+                                dataset=val_dataset,
+                                stats=stats,
+                                dataset_path=dataset_path,
+                                sample_idx=val_sample_idx,
+                                out_path=f"{args.output_dir}/{exp_name}/eval_val_trajectory_epoch_{epoch_idx + 1}.png",
+                                device=device,
+                            )
+                            print(f"    ✓ Saved to: {val_traj_results['image_path']}")
+                        except Exception as e:
+                            print(f"    ✗ Warning: Failed to visualize trajectory: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            val_traj_results = None
+                    else:
+                        # Use PushT-specific visualizations
+                        # Evaluate action policy on validation set
+                        print(f"  Evaluating action policy...")
+                        try:
+                            val_action_results = visualize_action_predictions(
+                                model=ema_model,
                                 dataset=val_dataset,
                                 stats=stats,
                                 sample_idx=val_sample_idx,
-                                out_path=f"{args.output_dir}/{exp_name}/eval_val_position_epoch_{epoch_idx + 1}.png",
+                                out_path=f"{args.output_dir}/{exp_name}/eval_val_action_epoch_{epoch_idx + 1}.png",
                                 device=device,
                             )
-                            print(f"    ✓ Position error: {val_position_results.get('pred_error', 0.0):.4f}")
-                            print(f"    ✓ Saved to: {val_position_results['image_path']}")
+                            print(f"    ✓ Action error: {val_action_results.get('action_error', 0.0):.4f}")
+                            print(f"    ✓ Saved to: {val_action_results['image_path']}")
                         except Exception as e:
-                            print(f"    ✗ Warning: Failed to evaluate position decoder: {e}")
+                            print(f"    ✗ Warning: Failed to evaluate action policy: {e}")
                             import traceback
                             traceback.print_exc()
-                    else:
-                        print(f"  Skipping position decoder evaluation (position decoder not available)")
-                    
-                    # Visualize full trajectory on validation set
-                    print(f"  Visualizing full trajectory...")
-                    try:
-                        val_traj_results = visualize_training_trajectory(
-                            model=ema_model,
-                            dataset=val_dataset,
-                            stats=stats,
-                            sample_idx=val_sample_idx,
-                            out_path=f"{args.output_dir}/{exp_name}/eval_val_trajectory_epoch_{epoch_idx + 1}.png",
-                            device=device,
-                        )
-                        print(f"    ✓ Saved to: {val_traj_results['image_path']}")
-                    except Exception as e:
-                        print(f"    ✗ Warning: Failed to visualize trajectory: {e}")
-                        import traceback
-                        traceback.print_exc()
+                            val_action_results = None
+                        
+                        # Evaluate position decoder (frame prediction) on validation set
+                        if ema_model.position_decoder is not None:
+                            print(f"  Evaluating position decoder (frame prediction)...")
+                            try:
+                                val_position_results = visualize_position_predictions(
+                                    model=ema_model,  # Pass full model so encoder is available
+                                    dataset=val_dataset,
+                                    stats=stats,
+                                    sample_idx=val_sample_idx,
+                                    out_path=f"{args.output_dir}/{exp_name}/eval_val_position_epoch_{epoch_idx + 1}.png",
+                                    device=device,
+                                )
+                                print(f"    ✓ Position error: {val_position_results.get('pred_error', 0.0):.4f}")
+                                print(f"    ✓ Saved to: {val_position_results['image_path']}")
+                            except Exception as e:
+                                print(f"    ✗ Warning: Failed to evaluate position decoder: {e}")
+                                import traceback
+                                traceback.print_exc()
+                                val_position_results = None
+                        else:
+                            print(f"  Skipping position decoder evaluation (position decoder not available)")
+                            val_position_results = None
+                        
+                        # Visualize full trajectory on validation set
+                        print(f"  Visualizing full trajectory...")
+                        try:
+                            val_traj_results = visualize_training_trajectory(
+                                model=ema_model,
+                                dataset=val_dataset,
+                                stats=stats,
+                                sample_idx=val_sample_idx,
+                                out_path=f"{args.output_dir}/{exp_name}/eval_val_trajectory_epoch_{epoch_idx + 1}.png",
+                                device=device,
+                            )
+                            print(f"    ✓ Saved to: {val_traj_results['image_path']}")
+                        except Exception as e:
+                            print(f"    ✗ Warning: Failed to visualize trajectory: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            val_traj_results = None
                 else:
                     print(f"\n{'='*60}")
                     print(f"VALIDATION SET EVALUATIONS (Epoch {epoch_idx + 1})")
@@ -693,6 +998,7 @@ if __name__ == "__main__":
         film_predict_scale=args.film_predict_scale,
         # input_noise_std=args.input_noise_std,
         disable_reference_conditioning=args.disable_reference_conditioning,
+        num_pickers=args.num_pickers,  # Pass num_pickers to model
     ).to(device)
     
     ema.copy_to(ema_model.parameters())
@@ -718,6 +1024,14 @@ if __name__ == "__main__":
         try:
             wandb.save(ckpt_path)
             wandb.finish()
+        except Exception:
+            pass
+    
+    # Clean up evaluation environment if it was created
+    if eval_env is not None:
+        try:
+            eval_env.close()
+            print("Closed evaluation environment")
         except Exception:
             pass
 

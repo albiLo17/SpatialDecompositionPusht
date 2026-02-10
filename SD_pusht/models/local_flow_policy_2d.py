@@ -32,26 +32,26 @@ except ImportError:
         return data
 
 
-class FiLMReEncoder2D(nn.Module):
+class FiLMReEncoder3D(nn.Module):
     """
-    FiLM (Feature-wise Linear Modulation) reencoder for 2D position conditioning.
+    FiLM (Feature-wise Linear Modulation) reencoder for 3D position conditioning.
     
     Adapts the encoded observation features based on the reference position using
     multiplicative (scale) and additive (bias) conditioning.
-    Similar to FiLMReEncoder in spatialdecomposition but for 2D positions.
+    Similar to FiLMReEncoder in spatialdecomposition but for 3D positions.
     """
     
     def __init__(
         self,
         feature_dim: int,
-        position_dim: int = 2,
+        position_dim: int = 3,
         hidden_dim: int = 32,
         predict_scale: bool = True,
     ):
         """
         Args:
             feature_dim: Dimension of the feature vector to be conditioned
-            position_dim: Dimension of the position (2 for 2D)
+            position_dim: Dimension of the position (3 for 3D: x, y, z)
             hidden_dim: Hidden dimension for the position encoder MLP
             predict_scale: If True, predict both scale and bias (full FiLM).
                           If False, only predict bias (additive conditioning only).
@@ -292,14 +292,18 @@ class DirectPositionMLP(nn.Module):
         obs_cond_dim: int,
         hidden_dims: list = None,
         activation: str = "mish",
+        num_pickers: int = 1,
     ):
         """
         Args:
             obs_cond_dim: Dimension of observation conditioning
             hidden_dims: List of hidden layer dimensions (default: [256, 512, 256])
             activation: Activation function ("mish", "relu", "gelu", "tanh")
+            num_pickers: Number of grippers/pickers (default: 1 for backward compatibility)
         """
         super().__init__()
+        
+        self.num_pickers = num_pickers
         
         if hidden_dims is None:
             hidden_dims = [256, 512, 256]
@@ -317,7 +321,7 @@ class DirectPositionMLP(nn.Module):
             raise ValueError(f"Unknown activation: {activation}")
         
         # Input: observation conditioning only
-        # Output: 2D position
+        # Output: 3D positions for all pickers (num_pickers * 3)
         input_features = obs_cond_dim
         
         # Build MLP layers
@@ -329,8 +333,8 @@ class DirectPositionMLP(nn.Module):
             layers.append(nn.LayerNorm(hidden_dim))  # Layer normalization for stability
             prev_dim = hidden_dim
         
-        # Output layer
-        layers.append(nn.Linear(prev_dim, 2))  # 2D position (x, y)
+        # Output layer: num_pickers * 3 (x, y, z for each picker)
+        layers.append(nn.Linear(prev_dim, num_pickers * 3))
         
         self.mlp = nn.Sequential(*layers)
     
@@ -342,17 +346,18 @@ class DirectPositionMLP(nn.Module):
             obs_cond: Observation conditioning, shape (B, obs_cond_dim)
         
         Returns:
-            position: Predicted 2D position, shape (B, 2)
+            position: Predicted 3D positions, shape (B, num_pickers, 3)
         """
-        return self.mlp(obs_cond)
+        output = self.mlp(obs_cond)  # (B, num_pickers * 3)
+        return output.reshape(-1, self.num_pickers, 3)  # (B, num_pickers, 3)
 
 
-class Position2DFlowDecoder(nn.Module):
+class Position3DFlowDecoder(nn.Module):
     """
-    Flow matching decoder for predicting a 2D reference position.
+    Flow matching decoder for predicting 3D reference positions for multiple grippers.
     
-    This is a simplified version for 2D tasks where we only need to predict
-    a translation (x, y) instead of a full pose.
+    This version predicts 3D positions (x, y, z) for tasks with 3D observations and actions.
+    Supports multiple grippers.
     """
     
     def __init__(
@@ -369,6 +374,7 @@ class Position2DFlowDecoder(nn.Module):
         use_flow_matching: bool = True,
         num_particles: int = 1,
         particles_aggregation: str = "median",  # "median" or "knn"
+        num_pickers: int = 1,  # Number of grippers/pickers
     ):
         """
         Args:
@@ -387,10 +393,12 @@ class Position2DFlowDecoder(nn.Module):
             particles_aggregation: Method to aggregate particles when num_particles > 1.
                 Options: "median" (element-wise median) or "knn" (KNN-based density estimation).
                 Default: "median".
+            num_pickers: Number of grippers/pickers (default: 1 for backward compatibility)
         """
         super().__init__()
         
-        self.POSITION_DIM = 2  # 2D position (x, y)
+        self.num_pickers = num_pickers
+        self.POSITION_DIM = 3 * num_pickers  # 3D position (x, y, z) for each picker
         self.fm_timesteps = fm_timesteps
         self.backbone = backbone.lower()
         self.use_flow_matching = use_flow_matching
@@ -410,6 +418,7 @@ class Position2DFlowDecoder(nn.Module):
                 obs_cond_dim=obs_cond_dim,
                 hidden_dims=mlp_hidden_dims,
                 activation=mlp_activation,
+                num_pickers=num_pickers,
             )
             # No flow matcher needed for direct regression
             self.FM = None
@@ -425,7 +434,7 @@ class Position2DFlowDecoder(nn.Module):
                 # Warn if multiple levels are used with T=1, as this can cause issues
                 import warnings
                 warnings.warn(
-                    f"Position2DFlowDecoder uses T=1 (single timestep). "
+                    f"Position3DFlowDecoder uses T=1 (single timestep). "
                     f"Using {len(down_dims)} downsampling levels may cause temporal dimension "
                     f"mismatches. Consider using a single level (e.g., [256]).",
                     UserWarning
@@ -471,12 +480,13 @@ class Position2DFlowDecoder(nn.Module):
         return_particles: bool = False
     ) -> torch.Tensor:
         """
-        Predict 2D position from observation conditioning.
+        Predict 3D positions for all grippers from observation conditioning.
         
         Args:
             obs_cond: Observation conditioning, shape (B, obs_cond_dim)
             x_init: Optional initial noise (only used if use_flow_matching=True)
                 If provided and num_particles > 1, this will be used as the first particle.
+                Shape should be (B, 1, POSITION_DIM) where POSITION_DIM = 3 * num_pickers
             k_clusters: Optional number of nearest neighbors for KNN aggregation (only used if particles_aggregation="knn").
                 If None, uses default k = max(1, P // 2) where P is num_particles.
                 This allows test-time ablation of the number of clusters.
@@ -485,16 +495,16 @@ class Position2DFlowDecoder(nn.Module):
         
         Returns:
             If return_particles=False:
-                position: 2D position, shape (B, 2)
+                position: 3D positions for all grippers, shape (B, num_pickers, 3)
                     If num_particles > 1, returns the median across particles or KNN-selected particle.
             If return_particles=True:
                 dict with:
-                    - 'position': 2D position, shape (B, 2)
-                    - 'all_particles': All particle positions, shape (B, num_particles, 2) or None
+                    - 'position': 3D positions, shape (B, num_pickers, 3)
+                    - 'all_particles': All particle positions, shape (B, num_particles, num_pickers, 3) or None
                     - 'selected_index': Index of selected particle per batch, shape (B,) or None
         """
         if not self.use_flow_matching:
-            # Direct regression: MLP(obs) -> position
+            # Direct regression: MLP(obs) -> positions (already reshaped to (B, num_pickers, 3))
             position = self.position_net(obs_cond)
             if return_particles:
                 return {
@@ -538,24 +548,25 @@ class Position2DFlowDecoder(nn.Module):
                         )
                         denoised_position = (vt * dt + denoised_position)
                     
-                    # Extract position for this particle
-                    particle_position = denoised_position.squeeze(1)  # (B, POSITION_DIM)
+                    # Extract position for this particle and reshape
+                    particle_position_flat = denoised_position.squeeze(1)  # (B, POSITION_DIM)
+                    particle_position = particle_position_flat.reshape(B, self.num_pickers, 3)  # (B, num_pickers, 3)
                     all_positions.append(particle_position)
             
-            # Stack all particle positions: (num_particles, B, POSITION_DIM)
-            all_positions = torch.stack(all_positions, dim=0)  # (num_particles, B, POSITION_DIM)
+            # Stack all particle positions: (num_particles, B, num_pickers, 3)
+            all_positions = torch.stack(all_positions, dim=0)  # (num_particles, B, num_pickers, 3)
             
-            # Transpose to (B, num_particles, POSITION_DIM) for easier batch processing
-            all_positions_bt = all_positions.transpose(0, 1)  # (B, num_particles, POSITION_DIM)
+            # Transpose to (B, num_particles, num_pickers, 3) for easier batch processing
+            all_positions_bt = all_positions.transpose(0, 1)  # (B, num_particles, num_pickers, 3)
             
             # Aggregate particles based on method
             if self.particles_aggregation == "median":
-                # Element-wise median across particles: (B, POSITION_DIM)
-                position = torch.median(all_positions, dim=0)[0]
+                # Element-wise median across particles: (B, num_pickers, 3)
+                position = torch.median(all_positions, dim=0)[0]  # (B, num_pickers, 3)
                 if return_particles:
                     return {
                         'position': position,
-                        'all_particles': all_positions_bt,  # (B, num_particles, POSITION_DIM)
+                        'all_particles': all_positions_bt,  # (B, num_particles, num_pickers, 3)
                         'selected_index': None  # Median doesn't have a single selected index
                     }
             elif self.particles_aggregation == "knn":
@@ -587,12 +598,12 @@ class Position2DFlowDecoder(nn.Module):
                 )
                 
                 # Select the chosen particle for each batch element
-                position = all_positions_bt[range(all_positions_bt.shape[0]), particle_idx]  # (B, POSITION_DIM)
+                position = all_positions_bt[range(all_positions_bt.shape[0]), particle_idx]  # (B, num_pickers, 3)
                 
                 if return_particles:
                     return {
                         'position': position,
-                        'all_particles': all_positions_bt,  # (B, num_particles, POSITION_DIM)
+                        'all_particles': all_positions_bt,  # (B, num_particles, num_pickers, 3)
                         'selected_index': particle_idx  # (B,)
                     }
             else:
@@ -644,8 +655,9 @@ class Position2DFlowDecoder(nn.Module):
                     )
                     denoised_position = (vt * dt + denoised_position)
         
-        # Extract position
-        position = denoised_position.squeeze(1)  # (B, POSITION_DIM)
+        # Extract position and reshape
+        position_flat = denoised_position.squeeze(1)  # (B, POSITION_DIM)
+        position = position_flat.reshape(B, self.num_pickers, 3)  # (B, num_pickers, 3)
         
         if return_particles:
             return {
@@ -670,16 +682,17 @@ class Position2DFlowDecoder(nn.Module):
         
         Args:
             obs_cond: Observation conditioning, shape (B, obs_cond_dim)
-            gt_positions: Ground truth 2D positions, shape (B, 2)
+            gt_positions: Ground truth 3D positions, shape (B, num_pickers, 3)
             x_0: Optional pre-sampled noise (only used if use_flow_matching=True)
+                Shape should be (B, 1, POSITION_DIM) where POSITION_DIM = 3 * num_pickers
         
         Returns:
             total_loss: Total loss value
             loss_dict: Dictionary with individual loss components
         """
         if not self.use_flow_matching:
-            # Direct regression: predict position and compute MSE
-            pred_positions = self.position_net(obs_cond)  # (B, 2)
+            # Direct regression: predict positions and compute MSE
+            pred_positions = self.position_net(obs_cond)  # (B, num_pickers, 3)
             loss = F.mse_loss(pred_positions, gt_positions)
             
             loss_dict = {
@@ -692,8 +705,10 @@ class Position2DFlowDecoder(nn.Module):
         B = obs_cond.shape[0]
         device = obs_cond.device
         
+        # Flatten GT positions: (B, num_pickers, 3) -> (B, POSITION_DIM)
+        gt_position_flat = gt_positions.reshape(B, self.POSITION_DIM)  # (B, POSITION_DIM)
         # Add horizon dimension for consistency with network
-        gt_position_flat = gt_positions.unsqueeze(1)  # (B, 2) -> (B, 1, 2)
+        gt_position_flat = gt_position_flat.unsqueeze(1)  # (B, POSITION_DIM) -> (B, 1, POSITION_DIM)
         
         # Sample noise
         if x_0 is None:
@@ -719,12 +734,12 @@ class Position2DFlowDecoder(nn.Module):
         return loss, loss_dict
 
 
-class LocalFlowPolicy2D(FlowMatching):
+class LocalFlowPolicy3D(FlowMatching):
     """
-    Local Flow Matching policy with 2D position decoder for spatial decomposition.
+    Local Flow Matching policy with 3D position decoder for spatial decomposition.
     
-    This extends FlowMatching for 2D tasks (like PushT) where we predict actions in a local
-    frame (relative to a 2D reference position), then transform them to the world frame
+    This extends FlowMatching for 3D tasks (like SoftGym) where we predict actions in a local
+    frame (relative to a 3D reference position), then transform them to the world frame
     using simple translation.
     """
     
@@ -762,10 +777,12 @@ class LocalFlowPolicy2D(FlowMatching):
         film_predict_scale: bool = True,
         # Ablation: disable reference position conditioning for local policy
         disable_reference_conditioning: bool = False,
+        # Multi-gripper support
+        num_pickers: int = 1,  # Number of grippers/pickers (default: 1 for backward compatibility)
     ):
         """
         Args:
-            act_dim: Action dimension
+            act_dim: Action dimension (should be 4 * num_pickers: dx, dy, dz, pick_flag per gripper)
             obs_horizon: Observation horizon
             act_horizon: Action horizon
             pred_horizon: Prediction horizon
@@ -792,8 +809,8 @@ class LocalFlowPolicy2D(FlowMatching):
                 training the local policy with privileged information to understand the 
                 best possible performance.
             transform_obs_to_local_frame: If True, transform observations to local frame 
-                (relative to reference position) before using them. For PushT, this subtracts 
-                the reference position from agent_x, agent_y, block_x, block_y (first 4 dims).
+                (relative to reference position) before using them. For SoftGym, this transforms
+                picker positions relative to their reference frames.
             use_film_conditioning: If True, use FiLM (Feature-wise Linear Modulation) to condition
                 observation features with reference position. Otherwise, use concatenation (default).
             film_hidden_dim: Hidden dimension for FiLM position encoder MLP
@@ -802,6 +819,7 @@ class LocalFlowPolicy2D(FlowMatching):
                 The reference position will still be used for action transformation (to local frame), but won't
                 be concatenated or used for FiLM conditioning. This is useful for ablation studies (baseline).
                 Default: False (use reference conditioning).
+            num_pickers: Number of grippers/pickers (default: 1 for backward compatibility)
         """
         super().__init__(
             act_dim=act_dim,
@@ -815,6 +833,17 @@ class LocalFlowPolicy2D(FlowMatching):
             down_dims=down_dims,
             n_groups=n_groups,
         )
+        
+        self.num_pickers = num_pickers
+        # Verify act_dim matches expected format: 4 * num_pickers (dx, dy, dz, pick_flag per gripper)
+        expected_act_dim = 4 * num_pickers
+        if act_dim != expected_act_dim:
+            import warnings
+            warnings.warn(
+                f"act_dim ({act_dim}) does not match expected format for {num_pickers} pickers "
+                f"(expected: {expected_act_dim} = 4 * {num_pickers}). "
+                f"Actions should be [dx1, dy1, dz1, pick1, dx2, dy2, dz2, pick2, ...]"
+            )
         
         self.use_position_decoder = use_position_decoder
         self.share_noise = share_noise
@@ -836,9 +865,9 @@ class LocalFlowPolicy2D(FlowMatching):
         
         # Create FiLM reencoder if enabled
         if use_film_conditioning:
-            self.pose_reencoder = FiLMReEncoder2D(
+            self.pose_reencoder = FiLMReEncoder3D(
                 feature_dim=self.obs_encoder_dim,
-                position_dim=2,  # 2D position (x, y)
+                position_dim=3,  # 3D position (x, y, z)
                 hidden_dim=film_hidden_dim,
                 predict_scale=film_predict_scale,
             )
@@ -846,8 +875,9 @@ class LocalFlowPolicy2D(FlowMatching):
             self.pose_reencoder = None
         
         if use_position_decoder:
-            # Position decoder now uses encoded observations
-            self.position_decoder = Position2DFlowDecoder(
+            # Position decoder now uses encoded observations and supports multiple grippers
+            self.position_decoder = Position3DFlowDecoder(
+                num_pickers=num_pickers,  # Pass num_pickers to position decoder
                 obs_cond_dim=self.obs_encoder_dim,  # Use encoded dimension
                 sigma=sigma,
                 fm_timesteps=position_decoder_fm_timesteps,
@@ -859,13 +889,14 @@ class LocalFlowPolicy2D(FlowMatching):
             )
             # Recreate noise_pred_net
             # If using FiLM, global_cond_dim is just obs_encoder_dim (position is modulated into features)
-            # Otherwise, global_cond_dim is obs_encoder_dim + 2 (position is concatenated)
-            REF_POSITION_DIM = 2  # 2D reference position (x, y)
+            # Otherwise, global_cond_dim is obs_encoder_dim + num_pickers * 3 (positions are concatenated)
+            REF_POSITION_DIM = 3 * num_pickers  # 3D reference positions for all grippers (x, y, z per gripper)
             if use_film_conditioning:
-                # With FiLM, position is modulated into features, so global_cond_dim is just obs_encoder_dim
+                # With FiLM, we average positions, so still just 3D, but network expects obs_encoder_dim
+                # Actually, FiLM still uses averaged 3D position, so global_cond_dim is just obs_encoder_dim
                 noise_cond_dim = self.obs_encoder_dim
             else:
-                # Without FiLM, concatenate position with obs encoding
+                # Without FiLM, concatenate all reference positions with obs encoding
                 noise_cond_dim = self.obs_encoder_dim + REF_POSITION_DIM
             # Apply same default as parent class if down_dims is None
             noise_net_down_dims = down_dims if down_dims is not None else [256, 512, 1024]
@@ -902,13 +933,14 @@ class LocalFlowPolicy2D(FlowMatching):
         
         Returns:
             action_noise: Noise for action prediction, shape (B, pred_horizon, act_dim) or None
-            position_noise: Noise for position prediction, shape (B, 1, 2) or None
+            position_noise: Noise for position prediction, shape (B, 1, POSITION_DIM) or None
+                where POSITION_DIM = 3 * num_pickers
         """
         if not self.share_noise:
             return None, None
         
         H = self.pred_horizon
-        P = 2  # POSITION_DIM
+        P = 3 * self.num_pickers  # POSITION_DIM = 3 * num_pickers (x, y, z for each picker)
         A = self.act_dim
         
         if self.shared_noise_base == "action":
@@ -918,11 +950,11 @@ class LocalFlowPolicy2D(FlowMatching):
             position_noise = action_noise.mean(dim=1, keepdim=True)  # (B, 1, A)
             variance_rescale = np.sqrt(H)
             position_noise = position_noise * variance_rescale
-            # Project from action_dim to 2D (take first 2 dims or pad)
-            if A >= 2:
-                position_noise = position_noise[:, :, :2]
+            # Project from action_dim to position_dim (take first P dims or pad)
+            if A >= P:
+                position_noise = position_noise[:, :, :P]
             else:
-                padding = torch.zeros((B, 1, 2 - A), device=device)
+                padding = torch.zeros((B, 1, P - A), device=device)
                 position_noise = torch.cat([position_noise, padding], dim=-1)
         
         elif self.shared_noise_base == "position":
@@ -932,11 +964,11 @@ class LocalFlowPolicy2D(FlowMatching):
             action_noise = position_noise.repeat(1, H, 1)
             variance_rescale = np.sqrt(H)
             action_noise = action_noise / variance_rescale
-            # Project from 2D to action_dim
-            if A <= 2:
+            # Project from position_dim to action_dim
+            if A <= P:
                 action_noise = action_noise[:, :, :A]
             else:
-                padding = torch.randn((B, H, A - 2), device=device) / variance_rescale
+                padding = torch.randn((B, H, A - P), device=device) / variance_rescale
                 action_noise = torch.cat([action_noise, padding], dim=-1)
         
         elif self.shared_noise_base == "combinatory":
@@ -954,29 +986,41 @@ class LocalFlowPolicy2D(FlowMatching):
     def _transform_obs_to_local_frame(
         self,
         obs_seq: torch.Tensor,
-        reference_position: torch.Tensor
+        reference_positions: torch.Tensor
     ) -> torch.Tensor:
         """
-        Transform observations to local frame (relative to reference position).
+        Transform observations to local frame (relative to reference positions).
         
-        For PushT, observations are [agent_x, agent_y, block_x, block_y, block_angle].
-        We subtract the reference position from the first 4 dimensions (positions).
+        For SoftGym, observations are [env_state (30 dims), picker1_x, picker1_y, picker1_z, picker2_x, picker2_y, picker2_z, ...].
+        We subtract each gripper's reference position from its picker position.
         
         Args:
             obs_seq: Observation sequence in world frame, shape (B, obs_horizon, obs_dim)
-            reference_position: Reference position, shape (B, 2)
+            reference_positions: Reference positions for all grippers, shape (B, num_pickers, 3)
         
         Returns:
             Transformed observation sequence in local frame, shape (B, obs_horizon, obs_dim)
         """
         local_obs_seq = obs_seq.clone()
-        # Subtract reference position from first 4 dimensions (agent_x, agent_y, block_x, block_y)
-        # For PushT: obs_dim=5, first 4 are positions
-        ref_pos_expanded = reference_position.unsqueeze(1)  # (B, 1, 2)
-        # Transform agent position (dims 0, 1) and block position (dims 2, 3)
-        local_obs_seq[:, :, :2] = obs_seq[:, :, :2] - ref_pos_expanded  # agent position
-        local_obs_seq[:, :, 2:4] = obs_seq[:, :, 2:4] - ref_pos_expanded  # block position
-        # block_angle (dim 4) stays the same
+        B, obs_horizon, obs_dim = obs_seq.shape
+        
+        # For SoftGym: obs contains [env_state, picker1_pos, picker2_pos, ...]
+        # Assume env_state is first 30 dims, then 3 dims per picker (x, y, z)
+        # Reference positions are 3D (x, y, z), so we transform all 3 dimensions
+        env_state_dim = obs_dim - 3 * self.num_pickers  # Typically 30 for SoftGym
+        
+        # Transform each picker's position relative to its reference frame
+        ref_pos_expanded = reference_positions.unsqueeze(1)  # (B, 1, num_pickers, 3)
+        
+        for picker_id in range(self.num_pickers):
+            picker_start_idx = env_state_dim + picker_id * 3
+            # Subtract reference position (x, y, z) from picker position (x, y, z)
+            local_obs_seq[:, :, picker_start_idx:picker_start_idx+3] = (
+                obs_seq[:, :, picker_start_idx:picker_start_idx+3] - 
+                ref_pos_expanded[:, :, picker_id, :]  # (B, 1, 3)
+            )
+        
+        # Environment state stays the same
         return local_obs_seq
     
     def get_action(
@@ -993,7 +1037,7 @@ class LocalFlowPolicy2D(FlowMatching):
         
         Args:
             obs_seq: Observation sequence, shape (B, obs_horizon, obs_dim)
-            reference_position: Optional reference 2D position for training, shape (B, 2)
+            reference_position: Optional reference 3D positions for all grippers, shape (B, num_pickers, 3)
             action_stats: Optional action statistics for normalization
             reference_pos_stats: Optional reference position statistics for normalization
             k_clusters: Optional number of nearest neighbors for KNN aggregation (only used if particles_aggregation="knn").
@@ -1003,7 +1047,7 @@ class LocalFlowPolicy2D(FlowMatching):
         Returns:
             Dictionary with:
                 - "actions": World frame actions, shape (B, act_horizon, act_dim)
-                - "reference_pos": Predicted reference position, shape (B, 2)
+                - "reference_pos": Predicted reference positions, shape (B, num_pickers, 3)
                 - "local_actions": Local frame actions, shape (B, act_horizon, act_dim)
                 - "particles_info": (optional, if return_particles=True) Dict with 'particles' and 'selected_index'
         """
@@ -1040,11 +1084,11 @@ class LocalFlowPolicy2D(FlowMatching):
                     ref_position = ref_position_result if isinstance(ref_position_result, torch.Tensor) else ref_position_result['position']
                     particles_info = None
             else:
-                # Use provided reference position or zero
+                # Use provided reference positions or zero
                 if reference_position is not None:
-                    ref_position = reference_position
+                    ref_position = reference_position  # (B, num_pickers, 3)
                 else:
-                    ref_position = torch.zeros((B, 2), device=device)
+                    ref_position = torch.zeros((B, self.num_pickers, 3), device=device)
             
             # Transform observations to local frame if requested
             if self.transform_obs_to_local_frame and ref_position is not None:
@@ -1057,9 +1101,13 @@ class LocalFlowPolicy2D(FlowMatching):
             obs_cond = self.obs_encoder(obs_flat_local)  # (B, obs_encoder_dim)
             
             # Apply FiLM conditioning if enabled (skip if reference conditioning is disabled)
+            # For multiple grippers, we average the reference positions for FiLM conditioning
+            # (or could condition each gripper separately, but averaging is simpler)
             if (self.use_position_decoder and self.use_film_conditioning and 
                 ref_position is not None and not self.disable_reference_conditioning):
-                obs_cond = self.pose_reencoder(obs_cond, ref_position)  # (B, obs_encoder_dim)
+                # Average reference positions across grippers for FiLM conditioning
+                ref_pos_avg = ref_position.mean(dim=1)  # (B, 3)
+                obs_cond = self.pose_reencoder(obs_cond, ref_pos_avg)  # (B, obs_encoder_dim)
             
             # Sample aligned noise for actions if sharing
             if self.share_noise:
@@ -1083,8 +1131,9 @@ class LocalFlowPolicy2D(FlowMatching):
                     # FiLM already applied above, use obs_cond directly
                     action_cond = obs_cond
                 else:
-                    # Concatenate obs_cond with ref_position for local action prediction
-                    action_cond = torch.cat([obs_cond, ref_position], dim=-1)  # (B, obs_encoder_dim + 2)
+                    # Concatenate obs_cond with flattened reference positions for local action prediction
+                    ref_pos_flat = ref_position.reshape(B, -1)  # (B, num_pickers * 3)
+                    action_cond = torch.cat([obs_cond, ref_pos_flat], dim=-1)  # (B, obs_encoder_dim + num_pickers * 3)
             else:
                 # No reference conditioning (ablation mode or no reference position available)
                 action_cond = obs_cond
@@ -1111,28 +1160,43 @@ class LocalFlowPolicy2D(FlowMatching):
             end = start + self.act_horizon
             local_actions = denoised_action_seq[:, start:end]  # (B, act_horizon, act_dim) - normalized local actions
             
-            # Transform local actions to world frame
-            # Steps: unnormalize local actions → transform to world frame → return unnormalized world actions
-            # This matches the training logic: unnormalize, transform, then we'll normalize in evaluation if needed
+            # Transform local actions to world frame per gripper
+            # Actions are [dx1, dy1, dz1, pick1, dx2, dy2, dz2, pick2, ...]
+            # For each gripper i: transform (dx_i, dy_i, dz_i) from local to world frame
+            # pick_flag stays the same
             if action_stats is not None and reference_pos_stats is not None:
                 # Unnormalize local actions (from normalized space to world coordinates)
                 local_actions_np = local_actions.detach().cpu().numpy()
                 local_actions_unnorm = unnormalize_data(local_actions_np, action_stats)
                 
-                # Unnormalize reference position
-                ref_pos_np = ref_position.detach().cpu().numpy()
-                ref_pos_unnorm = unnormalize_data(ref_pos_np, reference_pos_stats)
+                # Unnormalize reference positions
+                ref_pos_np = ref_position.detach().cpu().numpy()  # (B, num_pickers, 3)
+                ref_pos_unnorm = unnormalize_data(ref_pos_np, reference_pos_stats)  # (B, num_pickers, 3)
                 
-                # Transform to world frame: add reference position to first 2 dims
+                # Transform to world frame: for each gripper, add reference position to (dx, dy, dz)
+                # All three dimensions (dx, dy, dz) are transformed from local to world frame
                 world_actions_unnorm = local_actions_unnorm.copy()
-                world_actions_unnorm[:, :, :2] = local_actions_unnorm[:, :, :2] + ref_pos_unnorm[:, None, :]
+                
+                for picker_id in range(self.num_pickers):
+                    action_start_idx = picker_id * 4  # Each gripper has 4 dims: dx, dy, dz, pick_flag
+                    # Transform dx, dy, dz (first 3 of 4 dims) to world frame
+                    world_actions_unnorm[:, :, action_start_idx:action_start_idx+3] = (
+                        local_actions_unnorm[:, :, action_start_idx:action_start_idx+3] + 
+                        ref_pos_unnorm[:, None, picker_id, :]  # (B, 1, 3)
+                    )
+                    # pick_flag (action_start_idx+3) stays the same
                 
                 # Convert back to tensor (unnormalized world actions)
                 world_actions = torch.from_numpy(world_actions_unnorm).float().to(device)
             else:
                 # Fallback: simple addition in normalized space (incorrect but won't crash)
                 world_actions = local_actions.clone()
-                world_actions[:, :, :2] = local_actions[:, :, :2] + ref_position.unsqueeze(1)
+                for picker_id in range(self.num_pickers):
+                    action_start_idx = picker_id * 4
+                    world_actions[:, :, action_start_idx:action_start_idx+3] = (
+                        local_actions[:, :, action_start_idx:action_start_idx+3] + 
+                        ref_position[:, None, picker_id, :]  # (B, 1, 3)
+                    )
         
         result = {
             "actions": world_actions,
@@ -1160,7 +1224,7 @@ class LocalFlowPolicy2D(FlowMatching):
         Args:
             obs_seq: Observation sequence, shape (B, obs_horizon, obs_dim)
             action_seq: Action sequence in world frame, shape (B, pred_horizon, act_dim)
-            reference_position: Optional reference 2D position for training, shape (B, 2)
+            reference_position: Optional reference 3D positions for all grippers, shape (B, num_pickers, 3)
         
         Returns:
             total_loss: Total loss value
@@ -1225,10 +1289,12 @@ class LocalFlowPolicy2D(FlowMatching):
         
         # Apply FiLM conditioning if enabled (before action transformation)
         # Skip if reference conditioning is disabled (ablation/baseline)
+        # For multiple grippers, average reference positions for FiLM
         if (self.use_position_decoder and self.use_film_conditioning and 
             world_ref_position_for_conditioning is not None and 
             not self.disable_reference_conditioning):
-            obs_cond = self.pose_reencoder(obs_cond, world_ref_position_for_conditioning)  # (B, obs_encoder_dim)
+            ref_pos_avg = world_ref_position_for_conditioning.mean(dim=1)  # (B, 3)
+            obs_cond = self.pose_reencoder(obs_cond, ref_pos_avg)  # (B, obs_encoder_dim)
         
         # Transform world actions to local frame
         # Steps: unnormalize world actions → transform to local frame → normalize local actions
@@ -1242,9 +1308,18 @@ class LocalFlowPolicy2D(FlowMatching):
             ref_pos_np = world_ref_position_for_transform.detach().cpu().numpy()
             ref_pos_unnorm = unnormalize_data(ref_pos_np, reference_pos_stats)
             
-            # Transform to local frame: subtract reference position from first 2 dims
+            # Transform to local frame: for each gripper, subtract reference position from (dx, dy, dz)
+            # Actions are [dx1, dy1, dz1, pick1, dx2, dy2, dz2, pick2, ...]
             local_actions_unnorm = world_actions_unnorm.copy()
-            local_actions_unnorm[:, :, :2] = world_actions_unnorm[:, :, :2] - ref_pos_unnorm[:, None, :]
+            
+            for picker_id in range(self.num_pickers):
+                action_start_idx = picker_id * 4  # Each gripper has 4 dims: dx, dy, dz, pick_flag
+                # Transform dx, dy, dz (first 3 of 4 dims) to local frame
+                local_actions_unnorm[:, :, action_start_idx:action_start_idx+3] = (
+                    world_actions_unnorm[:, :, action_start_idx:action_start_idx+3] - 
+                    ref_pos_unnorm[:, None, picker_id, :]  # (B, 1, 3)
+                )
+                # pick_flag (action_start_idx+3) stays the same
             
             # Normalize local actions back to [-1, 1] range
             # Use the same normalization stats as world actions (assuming similar scale)
@@ -1256,7 +1331,12 @@ class LocalFlowPolicy2D(FlowMatching):
             # Fallback: simple subtraction in normalized space (old behavior, less correct)
             if world_ref_position_for_transform is not None:
                 local_action_seq = action_seq.clone()
-                local_action_seq[:, :, :2] = action_seq[:, :, :2] - world_ref_position_for_transform.unsqueeze(1)
+                for picker_id in range(self.num_pickers):
+                    action_start_idx = picker_id * 4
+                    local_action_seq[:, :, action_start_idx:action_start_idx+3] = (
+                        action_seq[:, :, action_start_idx:action_start_idx+3] - 
+                        world_ref_position_for_transform[:, None, picker_id, :]  # (B, 1, 3)
+                    )
             else:
                 local_action_seq = action_seq
         
@@ -1275,8 +1355,9 @@ class LocalFlowPolicy2D(FlowMatching):
         if (self.use_position_decoder and world_ref_position_for_conditioning is not None and 
             not self.disable_reference_conditioning):
             if not self.use_film_conditioning:
-                # Concatenate obs_cond with reference position for local action prediction
-                action_cond = torch.cat([obs_cond, world_ref_position_for_conditioning], dim=-1)  # (B, obs_encoder_dim + 2)
+                # Concatenate obs_cond with flattened reference positions for local action prediction
+                ref_pos_flat = world_ref_position_for_conditioning.reshape(B, -1)  # (B, num_pickers * 3)
+                action_cond = torch.cat([obs_cond, ref_pos_flat], dim=-1)  # (B, obs_encoder_dim + num_pickers * 3)
             else:
                 # FiLM already applied above, use obs_cond directly
                 action_cond = obs_cond

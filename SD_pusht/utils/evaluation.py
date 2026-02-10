@@ -10,7 +10,14 @@ import cv2
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
-from SD_pusht.utils.environment import make_env, apply_legacy_state
+try:
+    from SD_pusht.utils.environment import make_env, apply_legacy_state
+    GYM_PUSHT_AVAILABLE = True
+except ImportError:
+    GYM_PUSHT_AVAILABLE = False
+    make_env = None
+    apply_legacy_state = None
+
 from SD_pusht.utils.normalization import normalize_data, unnormalize_data
 from SD_pusht.utils.visualization import tile_images
 
@@ -92,6 +99,10 @@ def evaluate_model(
       dict with summary: mean_score, max_score, success_rate, steps_done, video_frames
       video_frames: numpy array of shape (T, H, W, C) for wandb logging (from first env only)
     """
+    if not GYM_PUSHT_AVAILABLE:
+        raise ImportError("gym_pusht is not installed. This function requires gym_pusht for PushT environment evaluation. "
+                         "Install it with: pip install gym-pusht")
+    
     if device is None:
         try:
             device = next(model.parameters()).device
@@ -270,6 +281,10 @@ def visualize_training_trajectory(
     Returns:
         Dictionary with visualization information
     """
+    if not GYM_PUSHT_AVAILABLE:
+        raise ImportError("gym_pusht is not installed. This function requires gym_pusht for PushT environment visualization. "
+                         "Install it with: pip install gym-pusht")
+    
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -604,6 +619,10 @@ def evaluate_local_flow_2d(
       dict with summary: mean_score, max_score, success_rate, steps_done, video_frames
       video_frames: numpy array of shape (T, H, W, C) for wandb logging (from first env only)
     """
+    if not GYM_PUSHT_AVAILABLE:
+        raise ImportError("gym_pusht is not installed. This function requires gym_pusht for PushT environment evaluation. "
+                         "Install it with: pip install gym-pusht")
+    
     if device is None:
         try:
             device = next(model.parameters()).device
@@ -877,6 +896,10 @@ def visualize_position_predictions(
     Returns:
         Dictionary with visualization information
     """
+    if not GYM_PUSHT_AVAILABLE:
+        raise ImportError("gym_pusht is not installed. This function requires gym_pusht for PushT environment visualization. "
+                         "Install it with: pip install gym-pusht")
+    
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -1014,6 +1037,10 @@ def visualize_action_predictions(
     Returns:
         Dictionary with visualization information
     """
+    if not GYM_PUSHT_AVAILABLE:
+        raise ImportError("gym_pusht is not installed. This function requires gym_pusht for PushT environment visualization. "
+                         "Install it with: pip install gym-pusht")
+    
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     

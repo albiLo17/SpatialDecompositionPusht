@@ -5,7 +5,11 @@ from .conditional_flow_matcher import ConditionalFlowMatcher
 from .diffusion import Diffusion
 from .flow_matching import FlowMatching
 from .local_flow_policy import LocalFlowPolicy, PoseFlowDecoder
-from .local_flow_policy_2d import LocalFlowPolicy2D, Position2DFlowDecoder, PositionMLP, DirectPositionMLP
+from .local_flow_policy_2d import LocalFlowPolicy3D, Position3DFlowDecoder, PositionMLP, DirectPositionMLP, FiLMReEncoder3D
+
+# Backward compatibility aliases (for existing code that uses 2D names)
+LocalFlowPolicy2D = LocalFlowPolicy3D
+Position2DFlowDecoder = Position3DFlowDecoder
 
 __all__ = [
     "ConditionalUnet1D",
@@ -14,9 +18,13 @@ __all__ = [
     "FlowMatching",
     "LocalFlowPolicy",
     "PoseFlowDecoder",
-    "LocalFlowPolicy2D",
-    "Position2DFlowDecoder",
+    "LocalFlowPolicy3D",
+    "Position3DFlowDecoder",
     "PositionMLP",
     "DirectPositionMLP",
+    "FiLMReEncoder3D",
+    # Backward compatibility
+    "LocalFlowPolicy2D",
+    "Position2DFlowDecoder",
 ]
 

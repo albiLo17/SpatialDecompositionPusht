@@ -6,6 +6,7 @@ from .push_t_segmented_dataset import (
     PushTSegmentedDatasetSimple,
     create_segmented_sample_indices,
 )
+from .softgym_segmented_dataset import SoftGymSegmentedDatasetSimple
 
 __all__ = [
     "PushTStateDataset",
@@ -14,5 +15,6 @@ __all__ = [
     "PushTSegmentedDataset",
     "PushTSegmentedDatasetSimple",
     "create_segmented_sample_indices",
+    "SoftGymSegmentedDatasetSimple",
 ]
 

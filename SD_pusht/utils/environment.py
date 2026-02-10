@@ -1,6 +1,11 @@
 """Environment utilities for PushT."""
 
-from gym_pusht.envs import PushTEnv
+try:
+    from gym_pusht.envs import PushTEnv
+    GYM_PUSHT_AVAILABLE = True
+except ImportError:
+    GYM_PUSHT_AVAILABLE = False
+    PushTEnv = None
 
 
 def make_env(render_mode="rgb_array", legacy=True, seed=None):
@@ -14,6 +19,9 @@ def make_env(render_mode="rgb_array", legacy=True, seed=None):
     Returns:
         A function that creates and returns a PushT environment.
     """
+    if not GYM_PUSHT_AVAILABLE:
+        raise ImportError("gym_pusht is not installed. Install it to use PushT environments.")
+    
     def _thunk():
         env = PushTEnv(render_mode=render_mode, legacy=legacy)
         if seed is not None:
@@ -29,6 +37,9 @@ def apply_legacy_state(env, state):
         env: PushTEnv instance.
         state: State array [agent_x, agent_y, block_x, block_y, block_angle].
     """
+    if not GYM_PUSHT_AVAILABLE:
+        raise ImportError("gym_pusht is not installed. Install it to use PushT environments.")
+    
     # state: [agent_x, agent_y, block_x, block_y, block_angle]
     agent_pos = list(state[:2])
     block_pos = list(state[2:4])

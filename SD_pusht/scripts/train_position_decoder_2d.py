@@ -35,6 +35,7 @@ import gdown
 
 from SD_pusht.models import Position2DFlowDecoder
 from SD_pusht.datasets import PushTSegmentedDatasetSimple
+from SD_pusht.datasets.softgym_segmented_dataset import SoftGymSegmentedDatasetSimple
 from SD_pusht.utils.evaluation import visualize_position_predictions
 from SD_pusht.utils.normalization import unnormalize_data
 
@@ -107,6 +108,9 @@ def parse_args():
                        help="Scale of noise to add to observations during training (0.0 = no noise)")
     parser.add_argument("--obs-noise-type", type=str, default="gaussian", choices=["gaussian", "uniform"],
                        help="Type of noise to add: 'gaussian' or 'uniform'")
+    # Multi-gripper support
+    parser.add_argument("--num-pickers", type=int, default=2,
+                       help="Number of grippers/pickers (default: 2)")
     return parser.parse_args()
 
 
@@ -166,21 +170,28 @@ if __name__ == "__main__":
         id = "1KY1InLurpMvJDRb14L9NlXT_fEsCvVUq&confirm=t"
         gdown.download(id=id, output=dataset_path, quiet=False)
 
-    # Load dataset info to get total number of episodes
+    # Load dataset info to get total number of episodes and metadata
     import zarr
     dataset_root = zarr.open(dataset_path, 'r')
     all_episode_ends = dataset_root['meta']['episode_ends'][:]
     total_episodes = len(all_episode_ends)
+    meta = dataset_root['meta']
     
-    # Create training dataset
-    dataset = PushTSegmentedDatasetSimple(
+    # Get num_pickers from dataset metadata
+    dataset_num_pickers = int(meta.attrs.get('num_picker', args.num_pickers))
+    if dataset_num_pickers != args.num_pickers:
+        print(f"Warning: Dataset has {dataset_num_pickers} pickers, but --num-pickers={args.num_pickers}. Using dataset value: {dataset_num_pickers}")
+        args.num_pickers = dataset_num_pickers
+    
+    # Create training dataset (use SoftGymSegmentedDatasetSimple for SoftGym datasets)
+    dataset = SoftGymSegmentedDatasetSimple(
         dataset_path=dataset_path,
         pred_horizon=args.pred_horizon,
         obs_horizon=args.obs_horizon,
         action_horizon=args.action_horizon,
         max_demos=args.max_demos,
-        use_contact_segmentation=True,
-        contact_threshold=args.contact_threshold,
+        use_gripper_segmentation=True,  # Use gripper-based segmentation
+        use_contact_segmentation=False,
         min_segment_length=args.min_segment_length,
     )
     
@@ -209,14 +220,14 @@ if __name__ == "__main__":
         
         try:
             min_pred_horizon = max(args.obs_horizon, 2)  # At least obs_horizon, minimum 2
-            val_dataset = PushTSegmentedDatasetSimple(
+            val_dataset = SoftGymSegmentedDatasetSimple(
                 dataset_path=dataset_path,
                 pred_horizon=min_pred_horizon,  # Must be >= obs_horizon to get enough observations
                 obs_horizon=args.obs_horizon,
                 action_horizon=1,
                 demo_indices=val_demo_indices,
-                use_contact_segmentation=True,
-                contact_threshold=args.contact_threshold,
+                use_gripper_segmentation=True,  # Use gripper-based segmentation
+                use_contact_segmentation=False,
                 min_segment_length=args.min_segment_length,
             )
             print(f"Created validation dataset with {len(val_dataset)} samples")
@@ -255,6 +266,7 @@ if __name__ == "__main__":
         mlp_hidden_dims=args.mlp_hidden_dims,
         mlp_activation=args.mlp_activation,
         use_flow_matching=use_flow_matching,
+        num_pickers=args.num_pickers,  # Pass num_pickers to model
     ).to(device)
     
     # Print model info
@@ -365,6 +377,7 @@ if __name__ == "__main__":
                     mlp_hidden_dims=args.mlp_hidden_dims,
                     mlp_activation=args.mlp_activation,
                     use_flow_matching=use_flow_matching,
+                    num_pickers=args.num_pickers,  # Pass num_pickers to model
                 ).to(device)
                 
                 ema.copy_to(ema_model.parameters())
@@ -437,6 +450,7 @@ if __name__ == "__main__":
         mlp_hidden_dims=args.mlp_hidden_dims,
         mlp_activation=args.mlp_activation,
         use_flow_matching=use_flow_matching,
+        num_pickers=args.num_pickers,  # Pass num_pickers to model
     ).to(device)
     
     ema.copy_to(ema_model.parameters())

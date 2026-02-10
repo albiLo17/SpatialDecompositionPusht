@@ -14,11 +14,16 @@ from SD_pusht.utils import (
     get_data_stats,
     normalize_data,
     unnormalize_data,
-    make_env,
-    apply_legacy_state,
     tile_images,
     evaluate_model,
 )
+
+# Optional imports (require gym_pusht)
+try:
+    from SD_pusht.utils.environment import make_env, apply_legacy_state
+except ImportError:
+    make_env = None
+    apply_legacy_state = None
 
 __all__ = [
     "ConditionalUnet1D",
@@ -26,14 +31,18 @@ __all__ = [
     "get_data_stats",
     "normalize_data",
     "unnormalize_data",
-    "make_env",
-    "apply_legacy_state",
     "tile_images",
     "evaluate_model",
     "ROOT_DIR",
     "DATASETS_DIR",
     "RUNS_DIR",
 ]
+
+# Add optional exports if available
+if make_env is not None:
+    __all__.append("make_env")
+if apply_legacy_state is not None:
+    __all__.append("apply_legacy_state")
 
 # Backward compatibility: support old import paths
 # These will be deprecated but kept for now
